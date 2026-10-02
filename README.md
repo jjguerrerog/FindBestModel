@@ -1,0 +1,164 @@
+# FindBestModel
+
+Find which of the 46 [MARRMoT](https://github.com/wknoben/MARRMoT) conceptual
+rainfall-runoff model structures best reproduces the daily streamflow of a USGS
+watershed.
+
+Give it a USGS gauge number and a period. It downloads the observed flow and the
+forcing data, runs a Latin-hypercube random search over the parameters of every
+model in parallel, and saves the performance of every realization. A Jupyter
+notebook then ranks the models, plots the best ones against the observations and
+exports the selected parameter set as a starting point for a full calibration.
+
+## How it works
+
+```
+USGS gauge ──► find_best_model.py ──► performance/<gauge>/*.parquet ──► compare_models.ipynb
+                 │                                                          │
+                 ├─ streamflow       (USGS NWIS)                             ├─ rank by any metric
+                 ├─ precipitation    (NOAA AORC basin average, or NASA POWER)├─ constraints (e.g. |PBIAS| < 15)
+                 ├─ ET + temperature (NASA POWER)                            ├─ hydrographs, FDC, Q-Q plots
+                 └─ N random realizations × 46 models                        └─ best_model_<metric>.json
+```
+
+Every realization is scored on NSE, KGE (and its r, alpha, beta parts), PBIAS,
+correlation, mean annual peak-flow difference, log-NSE and several
+`pdi_*` indexes. The first year(s) are a warm-up period and are not scored.
+
+## Installation
+
+Python 3.10+ (tested with 3.12).
+
+```bash
+git clone https://github.com/nicolas998/FindBestModel.git
+cd FindBestModel
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
+pip install -r requirements.txt
+```
+
+All data sources are public, so you don't need any accounts or API keys.
+
+## Example: USGS gauge 02249500
+
+### 1. Run the model search
+
+```bash
+python find_best_model.py --gauge 02249500 --n 200 --start-year 2015 --end-year 2025 --n-procs 8 --skip-snow
+```
+
+This:
+
+1. downloads daily streamflow for 2014–2025 (2014 is the warm-up year) to
+   `data/usgs_02249500_daily.parquet`;
+2. downloads the basin boundary, computes basin-averaged AORC rainfall, adds
+   NASA POWER ET, and saves them to `data/usgs_02249500_forcing.parquet`.
+   Products already in that file are reused on later runs;
+3. runs 200 parameter sets for each of the 34 models that don't need
+   temperature, on 8 processes;
+4. writes the results to `performance/02249500/`:
+
+```
+performance/02249500/
+├── model_01_Collie_River_Basin_1.parquet   # one row per realization: parameters + metrics
+├── model_02_Wetland_model.parquet
+├── ...
+├── summary.parquet                         # best scores of every model
+└── run_info.json                           # settings used, models removed and why
+```
+
+If you run it with no arguments (`python find_best_model.py`), it asks for
+each setting.
+
+### 2. Take a quick look at the summary
+
+```python
+import pandas as pd
+
+summary = pd.read_parquet("performance/02249500/summary.parquet")
+print(summary.sort_values("best_KGE", ascending=False).head())
+```
+
+### 3. Compare the models in the notebook
+
+Open `compare_models.ipynb`, edit the **Settings** cell and run all cells:
+
+```python
+GAUGE = "02249500"
+METRIC = "KGE"                                  # NSE, KGE, log_NSE, pdi_ave, pdi_low, PBIAS, ...
+TOP_N = 10                                      # models shown in the ranking
+CONSTRAINTS = {"PBIAS": (-15, 15), "NSE": (0, None)}  # (min, max); None = no bound
+SELECTED_MODEL = None                           # None = the top-ranked model
+```
+
+The notebook shows:
+
+- a ranking of the models by `METRIC`, keeping only realizations that meet `CONSTRAINTS`;
+- the spread of the metric within each model (box plots), to tell robust models
+  from lucky ones;
+- a table of each model's best value on each key metric;
+- the best realizations re-run and plotted against the observations
+  (hydrograph, flow-duration curve, Q-Q plot);
+- side-by-side comparison of up to 5 models, and an interactive (plotly) view of
+  the best model for each metric.
+
+The selected model, its parameters and its metrics are saved to
+`performance/02249500/best_model_KGE.json`.
+
+## Command-line options
+
+| Option | Default | Description |
+|---|---|---|
+| `--gauge` | *asked* | USGS site number, e.g. `02317620` |
+| `--n` | *asked* | random realizations per model |
+| `--start-year`, `--end-year` | *asked* | scored period |
+| `--n-procs` | *asked* | number of parallel processes |
+| `--warmup-years` | `1` | years simulated before `start-year` but not scored |
+| `--precip-source` | `aorc` | `aorc` (basin-averaged NOAA AORC, hourly summed to local days) or `nasa` (NASA POWER) |
+| `--nasa-sampling` | `point` | NASA POWER grid cell at the gauge (`point`) or area-weighted over the basin (`basin`) |
+| `--et-method` | `Turc` | `Penman`, `Hargreaves-Samani`, `Blaney-Criddle`, `Priestley-Taylor` or `Turc` |
+| `--models` | all 46 | subset, e.g. `"7,8,10-12"` |
+| `--skip-snow` | off | leave out the 12 snow models that need temperature |
+| `--seed` | `1` | random seed |
+
+For example, to try only GR4J (7) and a few others with NASA POWER rain averaged
+over the basin:
+
+```bash
+python find_best_model.py --gauge 02317620 --n 500 --start-year 2021 --end-year 2025 \
+    --n-procs 8 --models "7,11,13,28,34" --precip-source nasa --nasa-sampling basin
+```
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `find_best_model.py` | main script: data download, parallel random search, result tables |
+| `compare_models.ipynb` | ranking, plots and model selection |
+| `marrmot_models.py` | Python port of the 46 MARRMoT model structures (`MODEL_REGISTRY`) |
+| `model_parameter_space.py` | parameter sampling ranges for every model; edit these to change the prior |
+| `performance_metrics.py` | NSE, KGE, PBIAS, pdi and other goodness-of-fit metrics |
+| `get_usgs_gauge_data.py` | USGS streamflow + NASA POWER forcing and potential ET methods |
+| `get_aorc_basin_rainfall.py` | basin-averaged hourly AORC rainfall read from the AWS Zarr store; also runs on its own |
+| `get_watershed_boundary.py` | basin polygon from the USGS NLDI service |
+
+`data/` and `performance/` are created when you run the scripts and are not
+tracked by git.
+
+## Notes
+
+- This is a random search, not a calibration. Use it to pick a model
+  structure, then calibrate it, starting from the parameters in
+  `best_model_<metric>.json`.
+- A model is dropped from the results (and listed in `run_info.json` under
+  `models_removed`) when all of its realizations fail.
+- The parameter ranges in `model_parameter_space.py` fill gaps in the MARRMoT
+  catalogue. Treat them as a starting point, not a calibrated prior.
+
+## References
+
+Knoben, W. J. M., Freer, J. E., Fowler, K. J. A., Peel, M. C., & Woods, R. A.
+(2019). Modular Assessment of Rainfall–Runoff Models Toolbox (MARRMoT) v1.2.
+*Geoscientific Model Development*, 12, 2463–2480.
+https://doi.org/10.5194/gmd-12-2463-2019
