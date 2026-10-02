@@ -1,0 +1,17 @@
+# Downloaded forcing / streamflow and model search results
+data/
+performance/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
