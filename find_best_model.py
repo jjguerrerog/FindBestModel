@@ -24,6 +24,8 @@ For a given USGS gauge, this script:
 
 A model is removed (no table written) when every one of its realizations
 fails. Each model's first year(s) are a warm-up period and are not scored.
+Observed flows <= 0 (e.g. flow reversals at low-gradient gauges) are kept as
+they are by default; --nonpositive-obs offset/skip changes that.
 
 Usage (anything not passed on the command line is asked for interactively):
 
@@ -428,31 +430,34 @@ def _safe(fn, *args, **kwargs):
         return np.nan
 
 
-def compute_metrics(sim):
+def compute_metrics(sim, nonpositive_obs="keep", obs_offset_frac=0.01):
     """
     Same indexes as `pm.summary` + log_NSE (Example 5), but each one is
     computed on its own so a single undefined index (e.g. pdi_low on a
     stream with zero low flows) is NaN instead of failing the realization.
+    `nonpositive_obs` and `obs_offset_frac` set how observed flows <= 0 are
+    handled ('keep', 'offset' or 'skip'; see `pm._paired_values`).
     """
+    mode = {"nonpositive": nonpositive_obs, "offset_frac": obs_offset_frac}
     try:
-        kge = pm.kge(sim, "Q", "Qobs")
+        kge = pm.kge(sim, "Q", "Qobs", **mode)
     except Exception:
         kge = dict.fromkeys(("KGE", "r", "alpha", "beta"), np.nan)
     return {
-        "NSE": _safe(pm.nse, sim, "Q", "Qobs"),
+        "NSE": _safe(pm.nse, sim, "Q", "Qobs", **mode),
         "KGE": kge["KGE"],
         "r": kge["r"],
         "alpha": kge["alpha"],
         "beta": kge["beta"],
-        "PBIAS": _safe(pm.pbias, sim, "Q", "Qobs"),
-        "correlation": _safe(pm.correlation, sim, "Q", "Qobs"),
+        "PBIAS": _safe(pm.pbias, sim, "Q", "Qobs", **mode),
+        "correlation": _safe(pm.correlation, sim, "Q", "Qobs", **mode),
         "mean_annual_peak_flow_diff": _safe(pm.mean_annual_peak_flow_difference, sim, "Q", "Qobs"),
-        "pdi_ave": _safe(pm.percentiles_index, sim, [5, 25, 50, 75, 95], "Q", "Qobs"),
-        "pdi_ave2": _safe(pm.percentiles_index, sim, [1,5, 25, 75, 95,99], "Q", "Qobs"),
-        "pdi_ave3": _safe(pm.percentiles_index, sim, [10,30,60,90], "Q", "Qobs"),
-        "pdi_low": _safe(pm.percentiles_index, sim, [1, 5, 10, 15], "Q", "Qobs"),
-        "pdi_high": _safe(pm.percentiles_index, sim, [85, 90, 95, 99], "Q", "Qobs"),
-        "log_NSE": _safe(pm.nse, sim, "Q", "Qobs", log=True),
+        "pdi_ave": _safe(pm.percentiles_index, sim, [5, 25, 50, 75, 95], "Q", "Qobs", **mode),
+        "pdi_ave2": _safe(pm.percentiles_index, sim, [1,5, 25, 75, 95,99], "Q", "Qobs", **mode),
+        "pdi_ave3": _safe(pm.percentiles_index, sim, [10,30,60,90], "Q", "Qobs", **mode),
+        "pdi_low": _safe(pm.percentiles_index, sim, [1, 5, 10, 15], "Q", "Qobs", **mode),
+        "pdi_high": _safe(pm.percentiles_index, sim, [85, 90, 95, 99], "Q", "Qobs", **mode),
+        "log_NSE": _safe(pm.nse, sim, "Q", "Qobs", log=True, **mode),
     }
 
 
@@ -467,7 +472,7 @@ def _run_one(model_num, params):
             raise FloatingPointError("simulated flow is not finite")
         sim = pd.DataFrame({"Q": np.maximum(Q, Q_FLOOR), "Qobs": _DATA["Qobs"]},
                            index=_DATA["dates"])
-        return compute_metrics(sim), None
+        return compute_metrics(sim, _DATA["nonpositive_obs"], _DATA["obs_offset_frac"]), None
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}"
 
@@ -608,6 +613,15 @@ def parse_args():
     parser.add_argument("--models", type=_parse_models, default=sorted(marrmot.MODEL_REGISTRY),
                         help="subset of models, e.g. '7,8,10-12' (default: all 46)")
     parser.add_argument("--seed", type=int, default=1, help="random seed (default: 1)")
+    parser.add_argument("--nonpositive-obs", default="keep", choices=pm.NONPOSITIVE_MODES,
+                        help="observed flows <= 0 (e.g. flow reversals): 'keep' them as they are "
+                             "(default; log_NSE is then NaN and pdi_low/pdi_ave2 are unreliable), "
+                             "'offset' them for the log and percentile metrics only (clip at 0 and "
+                             "add --obs-offset-frac x mean flow to both series), or 'skip' those days "
+                             "in every metric")
+    parser.add_argument("--obs-offset-frac", type=float, default=0.01,
+                        help="offset for --nonpositive-obs offset, as a fraction of the mean "
+                             "observed flow (default: 0.01)")
     parser.add_argument("--skip-snow", action="store_true",
                         help="skip the 12 snow models that need temperature "
                              "(e.g. for watersheds without snow)")
@@ -634,6 +648,8 @@ def parse_args():
         parser.error("--gauge must be a numeric USGS site number")
     if args.end_year < args.start_year:
         parser.error("--end-year must not be before --start-year")
+    if args.obs_offset_frac <= 0:
+        parser.error("--obs-offset-frac must be positive")
     return args
 
 
@@ -644,6 +660,19 @@ def main():
     data = prepare_data(args.gauge, args.start_year, args.end_year,
                         args.warmup_years, args.et_method, skip_snow=args.skip_snow,
                         precip_source=args.precip_source, nasa_sampling=args.nasa_sampling)
+    data["nonpositive_obs"] = args.nonpositive_obs
+    data["obs_offset_frac"] = args.obs_offset_frac
+
+    n_nonpositive = int(np.sum(data["Qobs"] <= 0))
+    if n_nonpositive:
+        effect = {
+            "keep": "kept as they are: log_NSE will be NaN and pdi_low/pdi_ave2 unreliable",
+            "offset": f"clipped at 0 and offset by {args.obs_offset_frac:g} x mean flow "
+                      "in the log and percentile metrics",
+            "skip": "left out of every metric",
+        }[args.nonpositive_obs]
+        print(f"{n_nonpositive} observed days with flow <= 0: {effect} "
+              f"(--nonpositive-obs {args.nonpositive_obs})")
 
     skipped = []
     if data["T"] is None:
@@ -672,6 +701,8 @@ def main():
         "nasa_sampling": args.nasa_sampling,
         "et_method": args.et_method,
         "seed": args.seed,
+        "nonpositive_obs": args.nonpositive_obs,
+        "obs_offset_frac": args.obs_offset_frac,
         "initial_storage_mm": INITIAL_STORAGE,
         "temperature_available": data["T"] is not None,
         "models_evaluated": [int(m) for m in summary.index] if not summary.empty else [],

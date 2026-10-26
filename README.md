@@ -121,6 +121,8 @@ The selected model, its parameters and its metrics are saved to
 | `--models` | all 46 | subset, e.g. `"7,8,10-12"` |
 | `--skip-snow` | off | leave out the 12 snow models that need temperature |
 | `--seed` | `1` | random seed |
+| `--nonpositive-obs` | `keep` | observed flows <= 0 (e.g. flow reversals at low-gradient gauges): `keep` them as they are (`log_NSE` is then NaN and `pdi_low`/`pdi_ave2` unreliable), `offset` them in the log and percentile metrics only (clip at 0, add `--obs-offset-frac` × mean flow to both series), or `skip` those days in every metric |
+| `--obs-offset-frac` | `0.01` | offset used by `--nonpositive-obs offset`, as a fraction of the mean observed flow |
 
 For example, to try only GR4J (7) and a few others with NASA POWER rain averaged
 over the basin:
