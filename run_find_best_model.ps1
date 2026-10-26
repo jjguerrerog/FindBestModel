@@ -32,6 +32,10 @@ param(
 
     [string]$Models = "",          # e.g. "7,8,10-12"; empty = all 46 models
     [int]$Seed = 1,
+
+    [ValidateSet("keep", "offset", "skip")]
+    [string]$NonpositiveObs = "keep",   # observed flows <= 0
+    [double]$ObsOffsetFrac = 0.01,      # used by -NonpositiveObs offset
     [switch]$SkipSnow = $true,     # use -SkipSnow:$false to include snow models
 
     [string]$EnvPath = "D:\micromamba\envs\findbestmodel",
@@ -59,7 +63,9 @@ $pyArgs = @(
     "--precip-source", $PrecipSource,
     "--nasa-sampling", $NasaSampling,
     "--et-method", $EtMethod,
-    "--seed", $Seed
+    "--seed", $Seed,
+    "--nonpositive-obs", $NonpositiveObs,
+    "--obs-offset-frac", $ObsOffsetFrac.ToString([Globalization.CultureInfo]::InvariantCulture)
 )
 if ($Models) { $pyArgs += @("--models", $Models) }
 if ($SkipSnow) { $pyArgs += "--skip-snow" }
