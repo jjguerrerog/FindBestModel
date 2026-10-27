@@ -1,6 +1,7 @@
 # Downloaded forcing / streamflow and model search results
 data/
 performance/
+performance_holdout/
 
 # Python
 __pycache__/
