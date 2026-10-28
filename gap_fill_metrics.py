@@ -1,7 +1,9 @@
 """
 Selection metrics for the gap-filling tests (OUTLINE_gap_metrics.md, Part 1).
 
-This step holds only the shared helpers; the metrics are added in later steps.
+Shared helpers (ratio_term, normalize_weights, combine_terms) and the metrics
+built on them; so far: percentile_nse_index. More metrics are added in later
+steps.
 
 Conventions for every metric of this module:
 
@@ -23,12 +25,26 @@ Decisions (2026-10-28):
 - Negative, NaN or infinite weights, and all weights zero, raise errors.
 - ratio_term raises for any sim or obs value that is not finite or is <= 0,
   for both ratio options.
+
+Decisions for percentile_nse_index (tutor's logic decisions, 2026-10-28):
+
+- Zero and non-positive flows follow the existing --nonpositive-obs switch
+  (keep, offset, skip) exactly as in pm.percentiles_index; with the default
+  keep an observed percentile of exactly 0 makes the metric raise ValueError,
+  which the search wrapper turns into NaN; with offset the ratios work.
+- The NSE term reuses pm.nse, with the same pairing as the existing NSE column.
+- NSE is not clamped.
 """
 
 import math
 import numbers
 
+import numpy as np
+
+import performance_metrics as pm
+
 RATIO_OPTIONS = ("linear", "log")
+PERCENTILE_NSE_TERMS = ("low", "high", "nse")
 
 
 def _check_real(name, value):
@@ -125,3 +141,68 @@ def combine_terms(terms, weights=None):
             raise ValueError(f"term {name!r} must be finite and >= 0, got {value!r}")
     normalized = normalize_weights(list(terms), weights)
     return 1.0 - math.sqrt(sum(w * terms[name] for name, w in normalized.items()))
+
+
+def _check_percentile(name, value):
+    """Raise unless `value` is a real number strictly between 0 and 100."""
+    _check_real(name, value)
+    if not 0 < value < 100:
+        raise ValueError(f"{name} must be strictly between 0 and 100, got {value!r}")
+
+
+def percentile_nse_index(df, sim_col="Qsim", obs_col="Qobs", low_p=5, high_p=95,
+                         ratio="linear", weights=None, nonpositive="keep", offset_frac=0.01):
+    """
+    Percentile anchors plus NSE (the advisor's idea): 1 - sqrt of the weighted
+    sum of three terms, higher is better, ideal 1.
+
+    Terms (names in PERCENTILE_NSE_TERMS):
+        "low":  ratio_term(sim_low, obs_low, ratio), with sim_low and obs_low
+                the low_p percentile of each series (np.percentile, linear
+                interpolation, as in pm.percentiles_index);
+        "high": the same at high_p;
+        "nse":  (1 - NSE) ** 2, NSE from pm.nse. NSE is not clamped: 1 - NSE
+                is unbounded on poor models, so there it dominates the score.
+
+    Parameters:
+        df (pd.DataFrame): table containing `sim_col` and `obs_col`.
+        sim_col, obs_col (str): simulated and observed discharge columns.
+        low_p, high_p (real): percentiles strictly between 0 and 100,
+            low_p < high_p (ValueError otherwise; TypeError if not a number).
+        ratio (str): "linear" or "log" (see ratio_term).
+        weights (dict or None): weights by term name (see normalize_weights);
+            an unknown name raises ValueError.
+        nonpositive (str), offset_frac (float): how observed flows <= 0 are
+            handled ('keep', 'offset' or 'skip'; see pm._paired_values),
+            passed to both the percentile pairing and pm.nse.
+
+    Decisions (tutor's logic decisions, 2026-10-28):
+        - Zero and non-positive flows follow the existing --nonpositive-obs
+          switch (keep, offset, skip) exactly as in pm.percentiles_index; with
+          the default keep an observed percentile of exactly 0 makes the
+          metric raise ValueError, which the search wrapper turns into NaN;
+          with offset the ratios work.
+        - The NSE term reuses pm.nse, with the same pairing as the existing
+          NSE column.
+        - NSE is not clamped.
+
+    Returns:
+        float: the score, ideal 1.
+    """
+    _check_percentile("low_p", low_p)
+    _check_percentile("high_p", high_p)
+    if not low_p < high_p:
+        raise ValueError(f"low_p must be below high_p, got low_p={low_p!r}, high_p={high_p!r}")
+
+    sim, obs = pm._paired_values(df, sim_col, obs_col, log=False, positive=True,
+                                 nonpositive=nonpositive, offset_frac=offset_frac)
+    sim_low, sim_high = np.percentile(sim, [low_p, high_p])
+    obs_low, obs_high = np.percentile(obs, [low_p, high_p])
+    nse = pm.nse(df, sim_col, obs_col, nonpositive=nonpositive, offset_frac=offset_frac)
+
+    terms = {
+        "low": ratio_term(sim_low, obs_low, ratio),
+        "high": ratio_term(sim_high, obs_high, ratio),
+        "nse": (1.0 - nse) ** 2,
+    }
+    return combine_terms(terms, weights)
