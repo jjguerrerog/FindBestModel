@@ -26,13 +26,15 @@ Decisions (2026-10-28):
 """
 
 import math
+import numbers
 
 RATIO_OPTIONS = ("linear", "log")
 
 
 def _check_real(name, value):
-    """Raise TypeError unless `value` is a real number (int or float, not bool)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """Raise TypeError unless `value` is a real number (any numbers.Real, including
+    NumPy scalars such as float32, float64 and int64; not bool)."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise TypeError(f"{name} must be a real number, not {type(value).__name__} ({value!r})")
 
 
