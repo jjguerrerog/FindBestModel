@@ -14,14 +14,17 @@ The block is returned as a list of (start, end) date intervals (inclusive),
 so a later version can hide several gaps with the same code. holdout_mask
 and mask_hidden turn the intervals into hidden days for scoring, and
 check_results_folder keeps a run from overwriting earlier results.
+auto_run_label and is_valid_run_label name the per-run results folder.
 """
 
+import re
 from pathlib import Path
 
 import pandas as pd
 
 MODES = ("max_event", "min_flow")
 MIN_FLOW_WINDOW = 7  # [days] window of the 7-day mean in "min_flow" mode
+RUN_LABEL_PATTERN = re.compile(r"[A-Za-z0-9_-]+")  # letters, digits, underscore, hyphen
 
 
 def water_year(ts):
@@ -168,3 +171,21 @@ def check_results_folder(out_dir, overwrite=False):
             f"{run_info} already exists: the results in {Path(out_dir)} are from an earlier run, "
             "and this hold-out run would overwrite them. Pass --overwrite-results to allow it, "
             "or move that folder first.")
+
+
+def auto_run_label(mode, holdout_years, position, n, started_at):
+    """Automatic run label, e.g. none_n50_20261027_221305 or max_event_y3_mid_n50_20261027_221305.
+
+    `position` None (not given) is written "mid", a given value p<value>.
+    `started_at` is the local start time of the run (a datetime).
+    """
+    tokens = [mode]
+    if mode != "none":
+        tokens += [f"y{holdout_years}", "mid" if position is None else f"p{position}"]
+    tokens += [f"n{n}", started_at.strftime("%Y%m%d_%H%M%S")]
+    return "_".join(tokens)
+
+
+def is_valid_run_label(label):
+    """True if a manual run label has only letters, digits, underscore and hyphen (at least one)."""
+    return RUN_LABEL_PATTERN.fullmatch(label) is not None

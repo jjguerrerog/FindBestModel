@@ -9,9 +9,11 @@ Run from the repository root:  python -m unittest -v tests.test_holdout_masking
 
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -158,7 +160,8 @@ class TestMainOverwriteGuard(unittest.TestCase):
 
     def run_main(self, tmp, overwrite=False):
         argv = ["find_best_model_holdout.py", "--gauge", self.GAUGE, "--n", "1",
-                "--start-year", "2020", "--end-year", "2025", "--n-procs", "1"]
+                "--start-year", "2020", "--end-year", "2025", "--n-procs", "1",
+                "--run-label", "test_label"]
         if overwrite:
             argv.append("--overwrite-results")
         out, err = io.StringIO(), io.StringIO()
@@ -172,13 +175,14 @@ class TestMainOverwriteGuard(unittest.TestCase):
             finally:
                 self.stub, self.out, self.err = stub, out.getvalue(), err.getvalue()
 
+    # builds the per-run folder <tmp>/<gauge>/test_label, with run_info.json if requested
     def make_gauge_folder(self, tmp, with_run_info):
-        gauge_dir = Path(tmp) / self.GAUGE
-        gauge_dir.mkdir()
+        gauge_dir = Path(tmp) / self.GAUGE / "test_label"
+        gauge_dir.mkdir(parents=True)
         if with_run_info:
             (gauge_dir / "run_info.json").write_text("{}")
 
-    # <gauge>/run_info.json exists and no --overwrite-results: the guard raises
+    # <gauge>/test_label/run_info.json exists, no --overwrite-results: the guard raises
     # FileExistsError, main() catches it, prints the message and calls sys.exit(1)
     def test_blocked_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,7 +217,7 @@ class TestMainOverwriteGuard(unittest.TestCase):
                 self.run_main(tmp)
         self.stub.assert_called_once()
 
-    # <gauge> exists but is empty: no run_info.json, so the guard passes and
+    # <gauge>/test_label exists but is empty: no run_info.json, so the guard passes and
     # main() reaches the stub
     def test_empty_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +225,218 @@ class TestMainOverwriteGuard(unittest.TestCase):
             with self.assertRaises(_GuardPassed):
                 self.run_main(tmp)
         self.stub.assert_called_once()
+
+
+# 2026-10-27 22:13:05 local time at a fixed UTC offset of -4 hours (EDT)
+START = datetime(2026, 10, 27, 22, 13, 5, tzinfo=timezone(timedelta(hours=-4)))
+# the 18 keys run_info.json had before run-log, and the 9 added by run-log
+OLD_KEYS = ["gauge", "start_year", "end_year", "warmup_years", "n_realizations", "n_procs",
+            "seed", "precip_source", "nasa_sampling", "et_method", "nonpositive_obs",
+            "obs_offset_frac", "initial_storage_mm", "temperature_available",
+            "models_evaluated", "models_removed", "models_skipped_no_temperature",
+            "elapsed_seconds"]
+NEW_KEYS = ["run_label", "status", "started_at", "holdout_mode", "holdout_years",
+            "holdout_position", "holdout_intervals", "extreme_date", "extreme_value"]
+# hold-out information returned by the prepare_data stub (02232000-like values)
+STUB_HOLDOUT = {"intervals": [["2021-10-01", "2024-09-30"]],
+                "extreme_date": "2022-10-03", "extreme_value": 7.163}
+NO_HOLDOUT = {"intervals": None, "extreme_date": None, "extreme_value": None}
+
+
+class TestRunLog(unittest.TestCase):
+    # Tests for the per-run folder performance_holdout/<gauge>/<run_label>/ and
+    # the two writes of run_info.json. Tests that call main() patch sys.argv,
+    # PERFORMANCE_DIR (temporary folder), _now_local (START), prepare_data (a
+    # minimal data dict), run_search (a stub) and check_parameter_space (no-op),
+    # so no data is loaded or downloaded and no model runs.
+    GAUGE = "02232000"
+
+    def argv(self, *extra):
+        return ["find_best_model_holdout.py", "--gauge", self.GAUGE, "--n", "50",
+                "--start-year", "2020", "--end-year", "2025", "--n-procs", "1", *extra]
+
+    def run_main(self, tmp, argv, holdout=STUB_HOLDOUT, search=None):
+        data = {"T": np.zeros(1), "Qobs": np.array([1.0]), "holdout": holdout}
+        if search is None:
+            def search(out_dir, models, n, n_procs, data, seed):
+                return pd.DataFrame(), {}
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fbm, "PERFORMANCE_DIR", Path(tmp)), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(fbm, "_now_local", return_value=START), \
+                mock.patch.object(fbm, "prepare_data", return_value=data), \
+                mock.patch.object(fbm, "run_search", side_effect=search) as stub, \
+                mock.patch.object(fbm, "check_parameter_space"), \
+                contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.err):
+            self.search_stub = stub
+            fbm.main()
+
+    def read_run_info(self, run_dir):
+        return json.loads((run_dir / "run_info.json").read_text())
+
+    # mode none: tokens none, n50, stamp 20261027_221305 (START as YYYYMMDD_HHMMSS)
+    def test_label_without_holdout(self):
+        self.assertEqual(hb.auto_run_label("none", 3, None, 50, START),
+                         "none_n50_20261027_221305")
+
+    # max_event, 3 years, position not given -> y3, mid; then n50 and the stamp
+    def test_label_with_default_position(self):
+        self.assertEqual(hb.auto_run_label("max_event", 3, None, 50, START),
+                         "max_event_y3_mid_n50_20261027_221305")
+
+    # min_flow, 3 years, position 2 given -> y3, p2; then n50 and the stamp
+    def test_label_with_explicit_position(self):
+        self.assertEqual(hb.auto_run_label("min_flow", 3, 2, 50, START),
+                         "min_flow_y3_p2_n50_20261027_221305")
+
+    # "my_run-1" has only letters, digits, underscore and hyphen -> accepted, and
+    # the folder is <gauge>/my_run-1 exactly (no timestamp added)
+    def test_manual_label_accepted(self):
+        self.assertTrue(hb.is_valid_run_label("my_run-1"))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, self.argv("--run-label", "my_run-1"))
+            gauge_dir = Path(tmp) / self.GAUGE
+            self.assertEqual([p.name for p in gauge_dir.iterdir()], ["my_run-1"])
+            self.assertEqual(self.read_run_info(gauge_dir / "my_run-1")["run_label"], "my_run-1")
+
+    # "" (no character), "a/b" (slash), "a b" (space), "a:b" (colon), ".." (dots)
+    # each break the rule -> rejected; parse_args uses parser.error, which
+    # exits with code 2 (argparse's usage-error code)
+    def test_manual_label_rejected(self):
+        for label in ["", "a/b", "a b", "a:b", ".."]:
+            with self.subTest(label=label):
+                self.assertFalse(hb.is_valid_run_label(label))
+                with mock.patch.object(sys, "argv", self.argv("--run-label", label)), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as ctx:
+                        fbm.parse_args()
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("--run-label", err.getvalue())
+
+    # the folder is PERFORMANCE_DIR / gauge / label, PERFORMANCE_DIR read at call time
+    def test_run_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(fbm, "PERFORMANCE_DIR", Path(tmp)):
+                self.assertEqual(fbm._run_folder(self.GAUGE, "lbl"),
+                                 Path(tmp) / self.GAUGE / "lbl")
+
+    # the run_search stub reads run_info.json when it is called, i.e. after the
+    # early write and before any model would run
+    def test_early_write(self):
+        seen = {}
+
+        def search(out_dir, models, n, n_procs, data, seed):
+            seen["out_dir"] = out_dir
+            seen["exists"] = (out_dir / "run_info.json").exists()
+            seen["info"] = self.read_run_info(out_dir)
+            return pd.DataFrame(), {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, self.argv("--holdout-mode", "max_event", "--holdout-years", "3"),
+                          search=search)
+        info = seen["info"]
+        self.assertTrue(seen["exists"])
+        self.assertEqual(info["status"], "running")
+        # run_label is the name of the folder run_search was given
+        self.assertEqual(info["run_label"], seen["out_dir"].name)
+        # START in ISO 8601 with its -04:00 offset
+        self.assertEqual(info["started_at"], "2026-10-27T22:13:05-04:00")
+        # the label's last 15 characters are START as YYYYMMDD_HHMMSS, the same
+        # instant as started_at (2026-10-27 22:13:05)
+        self.assertEqual(info["run_label"][-15:], "20261027_221305")
+        # hold-out keys: mode and years from argv; position not given -> resolved
+        # to 3 // 2 = 1; the rest are the prepare_data stub's values
+        self.assertEqual(info["holdout_mode"], "max_event")
+        self.assertEqual(info["holdout_years"], 3)
+        self.assertEqual(info["holdout_position"], 1)
+        self.assertEqual(info["holdout_intervals"], [["2021-10-01", "2024-09-30"]])
+        self.assertEqual(info["extreme_date"], "2022-10-03")
+        self.assertEqual(info["extreme_value"], 7.163)
+        # keys known only after the models ran are absent
+        self.assertNotIn("models_evaluated", info)
+        self.assertNotIn("elapsed_seconds", info)
+
+    # after main() finishes: status "finished" and exactly the 18 old + 9 new keys
+    # (18 + 9 = 27)
+    def test_final_write(self):
+        expected = ["gauge", "start_year", "end_year", "warmup_years", "n_realizations",
+                    "n_procs", "seed", "precip_source", "nasa_sampling", "et_method",
+                    "nonpositive_obs", "obs_offset_frac", "initial_storage_mm",
+                    "temperature_available", "models_evaluated", "models_removed",
+                    "models_skipped_no_temperature", "elapsed_seconds",
+                    "run_label", "status", "started_at", "holdout_mode", "holdout_years",
+                    "holdout_position", "holdout_intervals", "extreme_date", "extreme_value"]
+        self.assertEqual(len(expected), 27)
+        self.assertEqual(expected, OLD_KEYS + NEW_KEYS)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, self.argv("--holdout-mode", "max_event", "--run-label", "final"))
+            info = self.read_run_info(Path(tmp) / self.GAUGE / "final")
+        self.assertEqual(info["status"], "finished")
+        self.assertEqual(sorted(info), sorted(expected))
+
+    # mode none: holdout_mode "none", the other five hold-out keys null; the
+    # automatic label is none_n50_20261027_221305 (see test_label_without_holdout)
+    def test_no_holdout_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, self.argv(), holdout=NO_HOLDOUT)
+            info = self.read_run_info(Path(tmp) / self.GAUGE / "none_n50_20261027_221305")
+        self.assertEqual(info["holdout_mode"], "none")
+        for key in ["holdout_years", "holdout_position", "holdout_intervals",
+                    "extreme_date", "extreme_value"]:
+            self.assertIsNone(info[key], key)
+
+    # run_search raises: the exception reaches the caller, and the early file
+    # (status "running") is still there, since the final write never happened
+    def test_crashed_run(self):
+        def search(out_dir, models, n, n_procs, data, seed):
+            raise RuntimeError("model crashed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError):
+                self.run_main(tmp, self.argv("--run-label", "crash"), search=search)
+            run_info = Path(tmp) / self.GAUGE / "crash" / "run_info.json"
+            self.assertTrue(run_info.exists())
+            self.assertEqual(self.read_run_info(run_info.parent)["status"], "running")
+
+    # the first run leaves <gauge>/again/run_info.json; a second run with the same
+    # label and no --overwrite-results hits the guard -> sys.exit(1)
+    def test_second_run_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, self.argv("--run-label", "again"))
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_main(tmp, self.argv("--run-label", "again"))
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("--overwrite-results", self.err.getvalue())
+            # the second run stopped at the guard, before run_search
+            self.search_stub.assert_not_called()
+
+    # no temperature (data stub T = None) and only snow models selected: models 6
+    # (Alpine model v1) and 12 (Alpine model v2) have 'T' in their forcing_vars
+    # (marrmot_models.MODEL_REGISTRY), so both are skipped, no model is left, and
+    # main() calls sys.exit("Nothing left to evaluate: ...") before the early write
+    def test_stops_before_writing(self):
+        data = {"T": None, "Qobs": np.array([1.0]), "holdout": NO_HOLDOUT}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(fbm, "PERFORMANCE_DIR", Path(tmp)), \
+                    mock.patch.object(sys, "argv", self.argv("--models", "6,12",
+                                                             "--run-label", "snow_only")), \
+                    mock.patch.object(fbm, "_now_local", return_value=START), \
+                    mock.patch.object(fbm, "prepare_data", return_value=data), \
+                    mock.patch.object(fbm, "run_search") as search_stub, \
+                    mock.patch.object(fbm, "check_parameter_space"), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    fbm.main()
+            # sys.exit(message) puts the message in SystemExit.code (the
+            # interpreter prints it and exits with status 1)
+            self.assertEqual(ctx.exception.code,
+                             "Nothing left to evaluate: every selected model needs temperature")
+            # main() stopped before run_search
+            self.assertEqual(search_stub.call_count, 0)
+            # no run folder and no run_info.json anywhere in the temporary folder
+            self.assertFalse((Path(tmp) / self.GAUGE / "snow_only").exists())
+            self.assertEqual(list(Path(tmp).rglob("run_info.json")), [])
 
 
 if __name__ == "__main__":

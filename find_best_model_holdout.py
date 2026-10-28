@@ -6,28 +6,44 @@
 # Differences from find_best_model.py:
 #   - PERFORMANCE_DIR (module constant): results go to performance_holdout/
 #     instead of performance/, so a hold-out run never overwrites a normal run.
-#   - Module docstring: the results path says performance_holdout/, and the
-#     usage examples call find_best_model_holdout.py.
-#   - New import: holdout_blocks (as hb).
+#     Each run has its own folder, performance_holdout/<gauge>/<run_label>/
+#     (the original writes into performance/<gauge>/).
+#   - Module docstring: the results path says
+#     performance_holdout/<gauge>/<run_label>/, and the usage examples call
+#     find_best_model_holdout.py.
+#   - New imports: holdout_blocks (as hb), datetime.
 #   - New arguments: --holdout-mode (none | max_event | min_flow, default none),
-#     --holdout-years, --holdout-position, --overwrite-results.
+#     --holdout-years, --holdout-position, --overwrite-results, --run-label.
 #     With --holdout-mode none the scores are the same as the original's.
 #   - Functions changed:
-#     - parse_args: the four new arguments and their checks.
-#     - main: overwrite guard (hb.check_results_folder) right after
-#       parse_args, before any data is prepared; it stops the run if the
-#       gauge folder already has a run_info.json, unless --overwrite-results
-#       (the original overwrites silently); it then prints only the message
-#       to stderr and exits with code 1. Passes the hold-out arguments to
-#       prepare_data.
+#     - parse_args: the five new arguments and their checks (a manual
+#       --run-label may hold only letters, digits, underscore and hyphen).
+#     - main: reads the clock once (_now_local) and builds the run label
+#       (--run-label, or hb.auto_run_label) and the run folder (_run_folder).
+#       Overwrite guard (hb.check_results_folder) on the run folder right
+#       after that, before any data is prepared; it stops the run if the run
+#       folder already has a run_info.json, unless --overwrite-results (the
+#       original overwrites silently); it then prints only the message to
+#       stderr and exits with code 1. Passes the hold-out arguments to
+#       prepare_data. Writes run_info.json twice: right before run_search
+#       (status "running", so a crashed run leaves a record; not written if
+#       main() stops with "Nothing left to evaluate") and at the end
+#       (status "finished"). New keys: run_label, status, started_at,
+#       holdout_mode, holdout_years, holdout_position, holdout_intervals,
+#       extreme_date, extreme_value.
+#     - _now_local (new): current local time, timezone-aware.
+#     - _run_folder (new): PERFORMANCE_DIR / gauge / run_label.
+#     - run_search: takes the run folder (out_dir) instead of the gauge.
 #     - _coverage_warnings (new): WARNING lines for the block's water years
 #       with less than 99% of their days observed
 #       (hb.low_coverage_water_years).
 #     - prepare_data: new holdout_mode, holdout_years and holdout_position
 #       arguments; builds the hold-out block (hb.build_holdout_block) on the
 #       observed evaluation days, prints it, prints _coverage_warnings, and adds
-#       data["hidden"] (all False with mode none). data["Qobs"] stays the
-#       full observed series.
+#       data["hidden"] (all False with mode none) and data["holdout"] (the
+#       block's intervals, extreme date and extreme value as JSON-ready
+#       types; all None with mode none). data["Qobs"] stays the full
+#       observed series.
 #     - _run_one: the models still simulate the whole period; on hidden days
 #       both the simulated and the observed flow are set to NaN
 #       (hb.mask_hidden) before compute_metrics, so a simulated peak on a
@@ -54,8 +70,8 @@ For a given USGS gauge, this script:
 3. Saves one table per model, with each realization's parameters and its
    NSE, KGE (+ KGE_r, KGE_alpha, KGE_beta), PBIAS, correlation, peak-flow difference,
    pdi_ave, pdi_ave2, pdi_ave3, pdi_low, pdi_high and log_NSE, to
-   `performance_holdout/<gauge>/model_NN_<name>.parquet`, plus a `summary.parquet`
-   with each model's best scores.
+   `performance_holdout/<gauge>/<run_label>/model_NN_<name>.parquet`, plus a
+   `summary.parquet` with each model's best scores and a `run_info.json`.
 
 A model is removed (no table written) when every one of its realizations
 fails. Each model's first year(s) are a warm-up period and are not scored.
@@ -82,6 +98,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -377,7 +394,10 @@ def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow
     With holdout_mode "max_event" or "min_flow", a block of holdout_years
     whole water years around that extreme of the observed flow is hidden
     from the scoring: data["hidden"] is True on its evaluation days (all
-    False with "none"). data["Qobs"] is still the full observed series.
+    False with "none"). data["holdout"] records the block for run_info.json:
+    intervals ([start, end] ISO dates), extreme_date (ISO date) and
+    extreme_value (float), all None with "none". data["Qobs"] is still the
+    full observed series.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     first_year = start_year - warmup_years
@@ -451,6 +471,7 @@ def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow
     eval_dates = dates[eval_mask]
     eval_qobs = qobs.to_numpy(dtype=float)[eval_mask]
     hidden = np.zeros(len(eval_dates), dtype=bool)
+    holdout = {"intervals": None, "extreme_date": None, "extreme_value": None}
     if holdout_mode != "none":
         observed = pd.Series(eval_qobs, index=eval_dates)
         block = hb.build_holdout_block(observed, holdout_mode,
@@ -463,6 +484,12 @@ def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow
               f"on {block['extreme_date'].date()}")
         for line in _coverage_warnings(observed, block["intervals"]):
             print(line)
+        holdout = {
+            "intervals": [[s.date().isoformat(), e.date().isoformat()]
+                          for s, e in block["intervals"]],
+            "extreme_date": block["extreme_date"].date().isoformat(),
+            "extreme_value": float(block["extreme_value"]),
+        }
 
     return {
         "P": forcing[PRECIP_COL].to_numpy(dtype=float),
@@ -473,6 +500,7 @@ def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow
         "dates": eval_dates,
         "eval_mask": eval_mask,
         "hidden": hidden,
+        "holdout": holdout,
     }
 
 
@@ -580,8 +608,17 @@ def _build_table(samples, outcomes):
     return table
 
 
-def run_search(gauge, models, n, n_procs, data, seed):
-    out_dir = PERFORMANCE_DIR / gauge
+def _now_local():
+    """Current local time, timezone-aware (one call per run: label and started_at)."""
+    return datetime.now().astimezone()
+
+
+def _run_folder(gauge, run_label):
+    """Results folder of one run: PERFORMANCE_DIR/<gauge>/<run_label> (read at call time)."""
+    return PERFORMANCE_DIR / gauge / run_label
+
+
+def run_search(out_dir, models, n, n_procs, data, seed):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     samples = {m: sample_parameters(m, n, seed=seed + m) for m in models}
@@ -713,6 +750,10 @@ def parse_args():
                              "(default: the middle year, holdout-years // 2)")
     parser.add_argument("--overwrite-results", action="store_true",
                         help="allow overwriting a results folder that already has a run_info.json")
+    parser.add_argument("--run-label", default=None,
+                        help="name of this run's results folder, performance_holdout/<gauge>/"
+                             "<run-label>/ (letters, digits, underscore, hyphen; default: built "
+                             "from the hold-out settings, --n and the start time)")
     args = parser.parse_args()
 
     cpus = os.cpu_count() or 1
@@ -738,6 +779,9 @@ def parse_args():
         parser.error("--end-year must not be before --start-year")
     if args.obs_offset_frac <= 0:
         parser.error("--obs-offset-frac must be positive")
+    if args.run_label is not None and not hb.is_valid_run_label(args.run_label):
+        parser.error("--run-label may contain only letters, digits, underscore and hyphen "
+                     "(at least one character)")
     if args.holdout_mode != "none":
         n_usable = len(hb.usable_water_years(args.start_year, args.end_year))
         if not 1 <= args.holdout_years <= n_usable:
@@ -750,11 +794,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # Guard against overwriting results. For now it checks the gauge folder; the
-    # run-log step moves the check to the per-run folder (the guard stays).
-    # Print only the message (no traceback) and exit non-zero.
+    # One clock reading feeds both the automatic label and started_at.
+    started_at = _now_local()
+    if args.run_label is not None:
+        run_label = args.run_label
+    else:
+        run_label = hb.auto_run_label(args.holdout_mode, args.holdout_years,
+                                      args.holdout_position, args.n, started_at)
+    out_dir = _run_folder(args.gauge, run_label)
+    # Guard against overwriting an earlier run with the same label (checks the
+    # run folder). Print only the message (no traceback) and exit non-zero.
     try:
-        hb.check_results_folder(PERFORMANCE_DIR / args.gauge, args.overwrite_results)
+        hb.check_results_folder(out_dir, args.overwrite_results)
     except FileExistsError as err:
         print(err, file=sys.stderr)
         sys.exit(1)
@@ -788,13 +839,10 @@ def main():
         if not args.models:
             sys.exit("Nothing left to evaluate: every selected model needs temperature")
 
-    print(f"\nEvaluating {len(args.models)} models x {args.n} realizations "
-          f"on {args.n_procs} processes...\n")
-    t0 = time.time()
-    summary, removed = run_search(args.gauge, args.models, args.n, args.n_procs, data, args.seed)
-    elapsed = time.time() - t0
-
-    out_dir = PERFORMANCE_DIR / args.gauge
+    # Early run_info.json (status "running"), written only once a real run is
+    # about to start: a run that crashes leaves a record.
+    has_holdout = args.holdout_mode != "none"
+    position = args.holdout_years // 2 if args.holdout_position is None else args.holdout_position
     run_info = {
         "gauge": args.gauge,
         "start_year": args.start_year,
@@ -810,11 +858,33 @@ def main():
         "obs_offset_frac": args.obs_offset_frac,
         "initial_storage_mm": INITIAL_STORAGE,
         "temperature_available": data["T"] is not None,
+        "run_label": run_label,
+        "status": "running",
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "holdout_mode": args.holdout_mode,
+        "holdout_years": args.holdout_years if has_holdout else None,
+        "holdout_position": position if has_holdout else None,
+        "holdout_intervals": data["holdout"]["intervals"],
+        "extreme_date": data["holdout"]["extreme_date"],
+        "extreme_value": data["holdout"]["extreme_value"],
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
+
+    print(f"\nEvaluating {len(args.models)} models x {args.n} realizations "
+          f"on {args.n_procs} processes...\n")
+    t0 = time.time()
+    summary, removed = run_search(out_dir, args.models, args.n, args.n_procs, data, args.seed)
+    elapsed = time.time() - t0
+
+    # Final run_info.json: same file, full content
+    run_info.update({
+        "status": "finished",
         "models_evaluated": [int(m) for m in summary.index] if not summary.empty else [],
         "models_removed": {str(m): err for m, err in removed.items()},
         "models_skipped_no_temperature": skipped,
         "elapsed_seconds": round(elapsed, 1),
-    }
+    })
     (out_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
 
     print(f"\nDone in {elapsed / 60:.1f} min. {len(summary)} model(s) kept, {len(removed)} removed.")
