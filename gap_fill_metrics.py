@@ -751,14 +751,21 @@ def metric_columns(configs=DEFAULT_CONFIGS):
     """
     Column names of `configs`, in order: the single source for the list of
     metric columns. Raises ValueError for an empty sequence or duplicate
-    column names.
+    column names, and TypeError for a config whose kwargs set nonpositive or
+    offset_frac (compute_all passes those itself).
     """
+    configs = list(configs)
     columns = [config.column for config in configs]
     if not columns:
         raise ValueError("configs is empty")
     duplicates = sorted({column for column in columns if columns.count(column) > 1})
     if duplicates:
         raise ValueError(f"duplicate column names in configs: {duplicates}")
+    for config in configs:
+        for key in ("nonpositive", "offset_frac"):
+            if key in config.kwargs:
+                raise TypeError(f"config {config.column!r} sets {key!r} in its kwargs; a config "
+                                f"must not set the switch itself, compute_all passes it")
     return columns
 
 
@@ -779,7 +786,8 @@ def compute_all(df, sim_col="Qsim", obs_col="Qobs", nonpositive="keep", offset_f
         nonpositive (str), offset_frac (float): passed to the metrics that
             accept them (see pm._paired_values).
         configs (sequence of MetricConfig): checked as in metric_columns
-            (ValueError for empty or duplicate columns) before any metric runs.
+            (ValueError for empty or duplicate columns, TypeError for a config
+            that sets nonpositive or offset_frac) before any metric runs.
         errors (dict or None): if a dict, errors[column] = str(exception) is
             stored for each column that failed with ValueError (TypeError if
             not None and not a dict).
@@ -791,10 +799,14 @@ def compute_all(df, sim_col="Qsim", obs_col="Qobs", nonpositive="keep", offset_f
         - The errors argument is for diagnosing NaN columns.
         - jdkge does not get the nonpositive settings.
         - No caching between metrics. Warnings are not suppressed.
+        - The errors dict is only added to, never cleared: pass a fresh dict
+          for each call.
+        - A config cannot set nonpositive or offset_frac (TypeError).
 
     Returns:
         dict: column name -> float (NaN for an undefined metric).
     """
+    configs = tuple(configs)
     metric_columns(configs)
     if errors is not None and not isinstance(errors, dict):
         raise TypeError(f"errors must be None or a dict, not {type(errors).__name__}")
