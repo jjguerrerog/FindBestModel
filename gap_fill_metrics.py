@@ -90,11 +90,25 @@ Decisions for jdkge (tutor's logic decisions, 2026-10-28):
 - _jsd_between raises ValueError when every value of both series is identical
   (all bin widths would be zero); jdkge cannot reach this because its std
   checks run first, the guard protects future callers.
+
+compute_all: runs every configuration of DEFAULT_CONFIGS (the outline's first
+column set; metric_columns gives the column names) and returns a dict of
+columns.
+
+Decisions for compute_all (tutor's logic decisions, 2026-10-28):
+
+- A ValueError means "the metric is undefined for these data" and gives NaN;
+  any other exception is a bug and propagates.
+- The errors argument collects the message of each NaN column, for
+  diagnosis.
+- jdkge does not get the nonpositive settings (accepts_nonpositive=False).
+- No caching between metrics.
 """
 
 import math
 import numbers
 import warnings
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -694,3 +708,106 @@ def jdkge(df, sim_col="Qsim", obs_col="Qobs", weights=None, ts_factor=1.0):
     terms = {"r": (1.0 - r) ** 2, "beta": (1.0 - beta) ** 2, "alpha": (1.0 - alpha) ** 2,
              "jsd": jsd ** 2}
     return combine_terms(terms, weights)
+
+
+@dataclass(frozen=True)
+class MetricConfig:
+    """
+    One metric column: column name, metric function, its keyword arguments,
+    and whether the function takes the nonpositive and offset_frac arguments.
+    """
+    column: str
+    function: object
+    kwargs: dict = field(default_factory=dict)
+    accepts_nonpositive: bool = True
+
+
+# The outline's first column set.
+DEFAULT_CONFIGS = (
+    MetricConfig("KGE_TA_p5_p95", kge_tail_anchors,
+                 {"low_p": 5, "high_p": 95, "ratio": "linear"}),
+    MetricConfig("KGE_TA_p5_p95_log", kge_tail_anchors,
+                 {"low_p": 5, "high_p": 95, "ratio": "log"}),
+    MetricConfig("KGE_TA_p2_p98", kge_tail_anchors,
+                 {"low_p": 2, "high_p": 98, "ratio": "linear"}),
+    MetricConfig("KGE_TA_p2_p98_log", kge_tail_anchors,
+                 {"low_p": 2, "high_p": 98, "ratio": "log"}),
+    MetricConfig("KGE_PB_pdi", kge_percentile_blocks,
+                 {"low_percentiles": DEFAULT_LOW_BLOCK, "high_percentiles": DEFAULT_HIGH_BLOCK,
+                  "ratio": "linear", "block_agg": "mean"}),
+    MetricConfig("KGE_PB_pdi_log", kge_percentile_blocks,
+                 {"low_percentiles": DEFAULT_LOW_BLOCK, "high_percentiles": DEFAULT_HIGH_BLOCK,
+                  "ratio": "log", "block_agg": "mean"}),
+    MetricConfig("PNSE_p5_p95", percentile_nse_index,
+                 {"low_p": 5, "high_p": 95, "ratio": "linear"}),
+    MetricConfig("PNSE_p5_p95_log", percentile_nse_index,
+                 {"low_p": 5, "high_p": 95, "ratio": "log"}),
+    MetricConfig("KGE_NP", kge_np, {}),
+    MetricConfig("JDKGE", jdkge, {}, accepts_nonpositive=False),
+)
+
+
+def metric_columns(configs=DEFAULT_CONFIGS):
+    """
+    Column names of `configs`, in order: the single source for the list of
+    metric columns. Raises ValueError for an empty sequence or duplicate
+    column names.
+    """
+    columns = [config.column for config in configs]
+    if not columns:
+        raise ValueError("configs is empty")
+    duplicates = sorted({column for column in columns if columns.count(column) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate column names in configs: {duplicates}")
+    return columns
+
+
+def compute_all(df, sim_col="Qsim", obs_col="Qobs", nonpositive="keep", offset_frac=0.01,
+                configs=DEFAULT_CONFIGS, errors=None):
+    """
+    Every metric of `configs` (default: DEFAULT_CONFIGS, the outline's first
+    column set) on one table, as a dict from column name to float, in config
+    order.
+
+    Each config's function is called as function(df, sim_col=sim_col,
+    obs_col=obs_col, **config.kwargs), plus nonpositive and offset_frac only
+    when config.accepts_nonpositive is True (jdkge has its own pipeline).
+
+    Parameters:
+        df (pd.DataFrame): table containing `sim_col` and `obs_col`.
+        sim_col, obs_col (str): simulated and observed discharge columns.
+        nonpositive (str), offset_frac (float): passed to the metrics that
+            accept them (see pm._paired_values).
+        configs (sequence of MetricConfig): checked as in metric_columns
+            (ValueError for empty or duplicate columns) before any metric runs.
+        errors (dict or None): if a dict, errors[column] = str(exception) is
+            stored for each column that failed with ValueError (TypeError if
+            not None and not a dict).
+
+    Decisions (tutor's logic decisions, 2026-10-28):
+        - A ValueError means "the metric is undefined for these data" and
+          gives NaN for that column; any other exception is a bug and
+          propagates.
+        - The errors argument is for diagnosing NaN columns.
+        - jdkge does not get the nonpositive settings.
+        - No caching between metrics. Warnings are not suppressed.
+
+    Returns:
+        dict: column name -> float (NaN for an undefined metric).
+    """
+    metric_columns(configs)
+    if errors is not None and not isinstance(errors, dict):
+        raise TypeError(f"errors must be None or a dict, not {type(errors).__name__}")
+    results = {}
+    for config in configs:
+        kwargs = dict(config.kwargs)
+        if config.accepts_nonpositive:
+            kwargs.update(nonpositive=nonpositive, offset_frac=offset_frac)
+        try:
+            results[config.column] = config.function(df, sim_col=sim_col, obs_col=obs_col,
+                                                     **kwargs)
+        except ValueError as exc:
+            results[config.column] = float("nan")
+            if errors is not None:
+                errors[config.column] = str(exc)
+    return results
