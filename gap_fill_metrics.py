@@ -44,6 +44,17 @@ Decisions for kge_tail_anchors (tutor's logic decisions, 2026-10-28):
   ValueError.
 - The percentile terms follow the nonpositive switch and raise for any
   percentile <= 0.
+
+kge_percentile_blocks: each block is one term, its percentile terms
+aggregated by block_agg. "mean" is the default: a block does not gain weight
+from having more percentiles (settled by J, 2026-10-27). "median" ignores both
+ends of a short block and hides the extreme percentile; it is an option to
+show the effect, not the default.
+
+Decisions for kge_percentile_blocks (tutor's logic decisions, 2026-10-28):
+
+- Percentile lists must be unique, strictly between 0 and 100, and every low
+  percentile below every high one.
 """
 
 import math
@@ -56,6 +67,10 @@ import performance_metrics as pm
 RATIO_OPTIONS = ("linear", "log")
 PERCENTILE_NSE_TERMS = ("low", "high", "nse")
 KGE_TAIL_ANCHOR_TERMS = ("r", "alpha", "beta", "low", "high")
+DEFAULT_LOW_BLOCK = (1, 5, 10, 15)      # same as the pdi_low list in performance_metrics
+DEFAULT_HIGH_BLOCK = (85, 90, 95, 99)   # same as the pdi_high list in performance_metrics
+BLOCK_AGG_OPTIONS = ("mean", "median", "max", "sum")
+KGE_PERCENTILE_BLOCK_TERMS = ("r", "alpha", "beta", "low_block", "high_block")
 
 
 def _check_real(name, value):
@@ -311,4 +326,82 @@ def kge_tail_anchors(df, sim_col="Qsim", obs_col="Qobs", low_p=5, high_p=95,
     terms = _kge_terms(df, sim_col, obs_col, nonpositive, offset_frac)
     terms["low"], terms["high"] = _percentile_terms(df, sim_col, obs_col, [low_p, high_p],
                                                     ratio, nonpositive, offset_frac)
+    return combine_terms(terms, weights)
+
+
+def _aggregate_block(values, block_agg):
+    """Mean, median, max or sum of a block's percentile terms, as a Python float."""
+    functions = {"mean": np.mean, "median": np.median, "max": np.max, "sum": np.sum}
+    if block_agg not in BLOCK_AGG_OPTIONS:
+        raise ValueError(f"block_agg must be one of {BLOCK_AGG_OPTIONS}, not {block_agg!r}")
+    return float(functions[block_agg](values))
+
+
+def _check_percentile_list(name, percentiles):
+    """Raise unless `percentiles` is a non-empty list or tuple of unique percentiles in (0, 100)."""
+    if not isinstance(percentiles, (list, tuple)):
+        raise TypeError(f"{name} must be a list or tuple, not {type(percentiles).__name__}")
+    if not percentiles:
+        raise ValueError(f"{name} is empty")
+    for i, value in enumerate(percentiles):
+        _check_percentile(f"{name}[{i}]", value)
+    if len(set(percentiles)) != len(percentiles):
+        raise ValueError(f"{name} has duplicate percentiles: {list(percentiles)}")
+
+
+def kge_percentile_blocks(df, sim_col="Qsim", obs_col="Qobs", low_percentiles=DEFAULT_LOW_BLOCK,
+                          high_percentiles=DEFAULT_HIGH_BLOCK, ratio="linear", block_agg="mean",
+                          weights=None, nonpositive="keep", offset_frac=0.01):
+    """
+    KGE plus a low and a high block of percentile terms: 1 - sqrt of the
+    weighted sum of five terms, higher is better, ideal 1.
+
+    Terms (names in KGE_PERCENTILE_BLOCK_TERMS):
+        "r", "alpha", "beta": as in kge_tail_anchors (pm.kge's components);
+        "low_block":  the percentile terms of low_percentiles (each
+                      ratio_term(sim_p, obs_p, ratio): (1 - R_p) ** 2 for
+                      linear, (ln R_p) ** 2 for log), aggregated by block_agg
+                      into ONE term;
+        "high_block": the same for high_percentiles.
+
+    "mean" is the default block_agg: a block does not gain weight from having
+    more percentiles (settled by J, 2026-10-27). "median" ignores both ends of
+    a short block and hides the extreme percentile; it is an option to show
+    the effect, not the default.
+
+    Parameters:
+        df (pd.DataFrame): table containing `sim_col` and `obs_col`.
+        sim_col, obs_col (str): simulated and observed discharge columns.
+        low_percentiles, high_percentiles (list or tuple): percentiles of each
+            block (default: the pdi_low and pdi_high lists).
+        ratio (str): "linear" or "log" (see ratio_term); only the blocks use it.
+        block_agg (str): one of BLOCK_AGG_OPTIONS ("mean", "median", "max",
+            "sum").
+        weights (dict or None): weights by term name (see normalize_weights);
+            an unknown name raises ValueError.
+        nonpositive (str), offset_frac (float): how observed flows <= 0 are
+            handled ('keep', 'offset' or 'skip'; see pm._paired_values). The
+            KGE terms pair with positive=False, the blocks with positive=True.
+
+    Decisions (tutor's logic decisions, 2026-10-28):
+        - Percentile lists must be unique, strictly between 0 and 100, and
+          every low percentile below every high one.
+
+    Returns:
+        float: the score, ideal 1.
+    """
+    if block_agg not in BLOCK_AGG_OPTIONS:
+        raise ValueError(f"block_agg must be one of {BLOCK_AGG_OPTIONS}, not {block_agg!r}")
+    _check_percentile_list("low_percentiles", low_percentiles)
+    _check_percentile_list("high_percentiles", high_percentiles)
+    if not max(low_percentiles) < min(high_percentiles):
+        raise ValueError(f"every low percentile must be below every high one, got "
+                         f"low_percentiles={list(low_percentiles)}, "
+                         f"high_percentiles={list(high_percentiles)}")
+
+    terms = _kge_terms(df, sim_col, obs_col, nonpositive, offset_frac)
+    for name, percentiles in (("low_block", low_percentiles), ("high_block", high_percentiles)):
+        block = _percentile_terms(df, sim_col, obs_col, list(percentiles), ratio,
+                                  nonpositive, offset_frac)
+        terms[name] = _aggregate_block(block, block_agg)
     return combine_terms(terms, weights)
