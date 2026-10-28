@@ -2,8 +2,8 @@
 Selection metrics for the gap-filling tests (OUTLINE_gap_metrics.md, Part 1).
 
 Shared helpers (ratio_term, normalize_weights, combine_terms) and the metrics
-built on them; so far: percentile_nse_index. More metrics are added in later
-steps.
+built on them; so far: percentile_nse_index, kge_tail_anchors,
+kge_percentile_blocks and kge_np. More metrics are added in later steps.
 
 Conventions for every metric of this module:
 
@@ -55,12 +55,24 @@ Decisions for kge_percentile_blocks (tutor's logic decisions, 2026-10-28):
 
 - Percentile lists must be unique, strictly between 0 and 100, and every low
   percentile below every high one.
+
+kge_np: the non-parametric KGE of Pool et al. (2018), Hydrological Sciences
+Journal 63(13-14), 1941-1953, Eqs. 1, 5, 6, 7: Spearman rank correlation r_s,
+alpha_np from the normalized flow-duration curves, beta = mean ratio.
+
+Decisions for kge_np (tutor's logic decisions, 2026-10-28):
+
+- Ties get average ranks (the paper does not say how to rank ties).
+- The pairing follows the nonpositive switch (positive=False).
+- The observed and simulated means must be positive.
+- A constant series (all ranks equal) raises ValueError.
 """
 
 import math
 import numbers
 
 import numpy as np
+import pandas as pd
 
 import performance_metrics as pm
 
@@ -71,6 +83,7 @@ DEFAULT_LOW_BLOCK = (1, 5, 10, 15)      # same as the pdi_low list in performanc
 DEFAULT_HIGH_BLOCK = (85, 90, 95, 99)   # same as the pdi_high list in performance_metrics
 BLOCK_AGG_OPTIONS = ("mean", "median", "max", "sum")
 KGE_PERCENTILE_BLOCK_TERMS = ("r", "alpha", "beta", "low_block", "high_block")
+KGE_NP_TERMS = ("r_s", "alpha_np", "beta")
 
 
 def _check_real(name, value):
@@ -405,3 +418,85 @@ def kge_percentile_blocks(df, sim_col="Qsim", obs_col="Qobs", low_percentiles=DE
                                   nonpositive, offset_frac)
         terms[name] = _aggregate_block(block, block_agg)
     return combine_terms(terms, weights)
+
+
+def _kge_np_terms(df, sim_col, obs_col, nonpositive, offset_frac):
+    """
+    Squared distances of the non-parametric KGE components (Pool et al. 2018):
+    {"r_s": (1 - r_s) ** 2, "alpha_np": (1 - alpha_np) ** 2,
+    "beta": (1 - beta) ** 2}. Pairs through pm._paired_values with
+    positive=False.
+
+    r_s: Pearson correlation of the ranks of the paired sim and obs (Eq. 6),
+    ties get average ranks. alpha_np = 1 - 0.5 * sum_k |sim_sorted[k] /
+    (n * mean_sim) - obs_sorted[k] / (n * mean_obs)| (Eq. 5), each series
+    sorted separately in descending order and divided by n times its own mean.
+    beta = mean_sim / mean_obs (Eq. 1).
+
+    Raises ValueError for fewer than 2 paired values, an observed or simulated
+    mean <= 0, or a series whose ranks are all equal (a constant series).
+    """
+    sim, obs = pm._paired_values(df, sim_col, obs_col, log=False, positive=False,
+                                 nonpositive=nonpositive, offset_frac=offset_frac)
+    n = len(obs)
+    if n < 2:
+        raise ValueError(f"KGE_NP needs at least 2 paired values, got {n}")
+    obs_mean, sim_mean = obs.mean(), sim.mean()
+    if obs_mean <= 0:
+        raise ValueError(f"observed series has mean {obs_mean!r} <= 0; KGE_NP is undefined")
+    if sim_mean <= 0:
+        raise ValueError(f"simulated series has mean {sim_mean!r} <= 0; KGE_NP is undefined")
+    obs_ranks = pd.Series(obs).rank(method="average").to_numpy()
+    sim_ranks = pd.Series(sim).rank(method="average").to_numpy()
+    if np.all(obs_ranks == obs_ranks[0]):
+        raise ValueError("observed series is constant (all ranks equal); "
+                         "the rank correlation is undefined")
+    if np.all(sim_ranks == sim_ranks[0]):
+        raise ValueError("simulated series is constant (all ranks equal); "
+                         "the rank correlation is undefined")
+    r_s = np.corrcoef(sim_ranks, obs_ranks)[0, 1]
+    sim_sorted = np.sort(sim)[::-1] / (n * sim_mean)
+    obs_sorted = np.sort(obs)[::-1] / (n * obs_mean)
+    alpha_np = 1.0 - 0.5 * np.sum(np.abs(sim_sorted - obs_sorted))
+    beta = sim_mean / obs_mean
+    return {"r_s": (1.0 - r_s) ** 2, "alpha_np": (1.0 - alpha_np) ** 2,
+            "beta": (1.0 - beta) ** 2}
+
+
+def kge_np(df, sim_col="Qsim", obs_col="Qobs", weights=None, nonpositive="keep",
+           offset_frac=0.01):
+    """
+    Non-parametric KGE (Pool et al. 2018, Hydrological Sciences Journal
+    63(13-14), 1941-1953, Eq. 7): 1 - sqrt of the weighted sum of three terms,
+    higher is better, ideal 1.
+
+    Terms (names in KGE_NP_TERMS):
+        "r_s":      (1 - r_s) ** 2, r_s the Spearman rank correlation: the
+                    Pearson correlation of the ranks of the paired series
+                    (Eq. 6);
+        "alpha_np": (1 - alpha_np) ** 2, alpha_np = 1 - 0.5 * sum_k
+                    |sim_sorted[k] / (n * mean_sim) - obs_sorted[k] /
+                    (n * mean_obs)| over the n pairs, each series sorted
+                    separately in descending order and divided by n times its
+                    own mean (Eq. 5);
+        "beta":     (1 - beta) ** 2, beta = mean_sim / mean_obs (Eq. 1).
+
+    Parameters:
+        df (pd.DataFrame): table containing `sim_col` and `obs_col`.
+        sim_col, obs_col (str): simulated and observed discharge columns.
+        weights (dict or None): weights by term name (see normalize_weights);
+            an unknown name raises ValueError.
+        nonpositive (str), offset_frac (float): how observed flows <= 0 are
+            handled ('keep', 'offset' or 'skip'; see pm._paired_values). The
+            pairing uses positive=False, so 'offset' does not shift it.
+
+    Decisions (tutor's logic decisions, 2026-10-28):
+        - Ties get average ranks (the paper does not say how to rank ties).
+        - The pairing follows the nonpositive switch.
+        - The observed and simulated means must be positive (ValueError).
+        - A constant series (all ranks equal) raises ValueError.
+
+    Returns:
+        float: the score, ideal 1.
+    """
+    return combine_terms(_kge_np_terms(df, sim_col, obs_col, nonpositive, offset_frac), weights)
