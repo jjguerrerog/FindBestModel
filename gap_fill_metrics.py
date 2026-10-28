@@ -36,6 +36,14 @@ Decisions for percentile_nse_index (tutor's logic decisions, 2026-10-28):
   search wrapper turns into NaN; with offset the ratios work.
 - The NSE term reuses pm.nse, with the same pairing as the existing NSE column.
 - NSE is not clamped.
+
+Decisions for kge_tail_anchors (tutor's logic decisions, 2026-10-28):
+
+- The ratio option changes only the percentile terms, never r, alpha or beta.
+- Zero variance (observed or simulated) and a zero observed mean raise
+  ValueError.
+- The percentile terms follow the nonpositive switch and raise for any
+  percentile <= 0.
 """
 
 import math
@@ -47,6 +55,7 @@ import performance_metrics as pm
 
 RATIO_OPTIONS = ("linear", "log")
 PERCENTILE_NSE_TERMS = ("low", "high", "nse")
+KGE_TAIL_ANCHOR_TERMS = ("r", "alpha", "beta", "low", "high")
 
 
 def _check_real(name, value):
@@ -209,4 +218,97 @@ def percentile_nse_index(df, sim_col="Qsim", obs_col="Qobs", low_p=5, high_p=95,
         "high": ratio_term(sim_high, obs_high, ratio),
         "nse": (1.0 - nse) ** 2,
     }
+    return combine_terms(terms, weights)
+
+
+def _kge_terms(df, sim_col, obs_col, nonpositive, offset_frac):
+    """
+    Squared distances of the KGE components: {"r": (1 - r) ** 2,
+    "alpha": (1 - alpha) ** 2, "beta": (1 - beta) ** 2}, with r the Pearson
+    correlation, alpha = std(sim) / std(obs) and beta = mean(sim) / mean(obs),
+    as in pm.kge. Pairs through pm._paired_values with positive=False.
+
+    Raises ValueError for fewer than 2 paired values, a zero observed or
+    simulated std, or a zero observed mean.
+    """
+    sim, obs = pm._paired_values(df, sim_col, obs_col, log=False, positive=False,
+                                 nonpositive=nonpositive, offset_frac=offset_frac)
+    if len(obs) < 2:
+        raise ValueError(f"KGE needs at least 2 paired values, got {len(obs)}")
+    obs_std, sim_std, obs_mean = obs.std(), sim.std(), obs.mean()
+    if obs_std == 0:
+        raise ValueError("observed series has zero variance; KGE is undefined")
+    if sim_std == 0:
+        raise ValueError("simulated series has zero variance; KGE is undefined")
+    if obs_mean == 0:
+        raise ValueError("observed series has zero mean; KGE is undefined")
+    r = np.corrcoef(sim, obs)[0, 1]
+    alpha = sim_std / obs_std
+    beta = sim.mean() / obs_mean
+    return {"r": (1.0 - r) ** 2, "alpha": (1.0 - alpha) ** 2, "beta": (1.0 - beta) ** 2}
+
+
+def _percentile_terms(df, sim_col, obs_col, percentiles, ratio, nonpositive, offset_frac):
+    """
+    One ratio_term(sim_p, obs_p, ratio) per percentile, in order, with sim_p
+    and obs_p the percentiles of each series (np.percentile, linear
+    interpolation). Pairs through pm._paired_values with positive=True.
+    """
+    sim, obs = pm._paired_values(df, sim_col, obs_col, log=False, positive=True,
+                                 nonpositive=nonpositive, offset_frac=offset_frac)
+    sim_p = np.percentile(sim, percentiles)
+    obs_p = np.percentile(obs, percentiles)
+    return [ratio_term(s, o, ratio) for s, o in zip(sim_p, obs_p)]
+
+
+def kge_tail_anchors(df, sim_col="Qsim", obs_col="Qobs", low_p=5, high_p=95,
+                     ratio="linear", weights=None, nonpositive="keep", offset_frac=0.01):
+    """
+    KGE plus one low and one high percentile anchor: 1 - sqrt of the weighted
+    sum of five terms, higher is better, ideal 1.
+
+    Terms (names in KGE_TAIL_ANCHOR_TERMS):
+        "r", "alpha", "beta": (1 - r) ** 2, (1 - alpha) ** 2, (1 - beta) ** 2,
+                with r the Pearson correlation, alpha = std(sim) / std(obs)
+                and beta = mean(sim) / mean(obs), as in pm.kge;
+        "low":  ratio_term(sim_low, obs_low, ratio), with sim_low and obs_low
+                the low_p percentile of each series (np.percentile, linear
+                interpolation);
+        "high": the same at high_p.
+
+    Pairing: the KGE terms pair through pm._paired_values with
+    positive=False, the percentile terms with positive=True (so 'offset'
+    shifts only the percentile terms).
+
+    Parameters:
+        df (pd.DataFrame): table containing `sim_col` and `obs_col`.
+        sim_col, obs_col (str): simulated and observed discharge columns.
+        low_p, high_p (real): percentiles strictly between 0 and 100,
+            low_p < high_p (ValueError otherwise; TypeError if not a number).
+        ratio (str): "linear" or "log" (see ratio_term); only the percentile
+            terms use it.
+        weights (dict or None): weights by term name (see normalize_weights);
+            an unknown name raises ValueError.
+        nonpositive (str), offset_frac (float): how observed flows <= 0 are
+            handled ('keep', 'offset' or 'skip'; see pm._paired_values).
+
+    Decisions (tutor's logic decisions, 2026-10-28):
+        - The ratio option changes only the percentile terms, never r, alpha
+          or beta.
+        - Zero variance (observed or simulated) and a zero observed mean
+          raise ValueError.
+        - The percentile terms follow the nonpositive switch and raise for
+          any percentile <= 0.
+
+    Returns:
+        float: the score, ideal 1.
+    """
+    _check_percentile("low_p", low_p)
+    _check_percentile("high_p", high_p)
+    if not low_p < high_p:
+        raise ValueError(f"low_p must be below high_p, got low_p={low_p!r}, high_p={high_p!r}")
+
+    terms = _kge_terms(df, sim_col, obs_col, nonpositive, offset_frac)
+    terms["low"], terms["high"] = _percentile_terms(df, sim_col, obs_col, [low_p, high_p],
+                                                    ratio, nonpositive, offset_frac)
     return combine_terms(terms, weights)
