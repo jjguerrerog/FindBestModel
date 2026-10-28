@@ -29,9 +29,11 @@ Decisions (2026-10-28):
 Decisions for percentile_nse_index (tutor's logic decisions, 2026-10-28):
 
 - Zero and non-positive flows follow the existing --nonpositive-obs switch
-  (keep, offset, skip) exactly as in pm.percentiles_index; with the default
-  keep an observed percentile of exactly 0 makes the metric raise ValueError,
-  which the search wrapper turns into NaN; with offset the ratios work.
+  (keep, offset, skip) like pm.percentiles_index, except that every
+  percentile <= 0 or not finite, observed or simulated, raises ValueError
+  (pm.percentiles_index raises only on an observed percentile of exactly 0);
+  with the default keep such a percentile makes the metric raise, which the
+  search wrapper turns into NaN; with offset the ratios work.
 - The NSE term reuses pm.nse, with the same pairing as the existing NSE column.
 - NSE is not clamped.
 """
@@ -178,9 +180,11 @@ def percentile_nse_index(df, sim_col="Qsim", obs_col="Qobs", low_p=5, high_p=95,
 
     Decisions (tutor's logic decisions, 2026-10-28):
         - Zero and non-positive flows follow the existing --nonpositive-obs
-          switch (keep, offset, skip) exactly as in pm.percentiles_index; with
-          the default keep an observed percentile of exactly 0 makes the
-          metric raise ValueError, which the search wrapper turns into NaN;
+          switch (keep, offset, skip) like pm.percentiles_index, except that
+          every percentile <= 0 or not finite, observed or simulated, raises
+          ValueError (pm.percentiles_index raises only on an observed
+          percentile of exactly 0); with the default keep such a percentile
+          makes the metric raise, which the search wrapper turns into NaN;
           with offset the ratios work.
         - The NSE term reuses pm.nse, with the same pairing as the existing
           NSE column.
