@@ -3,7 +3,8 @@ Selection metrics for the gap-filling tests (OUTLINE_gap_metrics.md, Part 1).
 
 Shared helpers (ratio_term, normalize_weights, combine_terms) and the metrics
 built on them; so far: percentile_nse_index, kge_tail_anchors,
-kge_percentile_blocks and kge_np. More metrics are added in later steps.
+kge_percentile_blocks, kge_np and jdkge. More metrics are added in later
+steps.
 
 Conventions for every metric of this module:
 
@@ -66,10 +67,28 @@ Decisions for kge_np (tutor's logic decisions, 2026-10-28):
 - The pairing follows the nonpositive switch (positive=False).
 - The observed and simulated means must be positive.
 - A constant series (all ranks equal) raises ValueError.
+
+jdkge: KGE' plus the squared Jensen-Shannon divergence of the log-flow
+histograms, after Ficchi et al. (2026), preprint egusphere-2026-43, Eq. 2 and
+Sections 2.1.2 and 2.1.3.
+
+Decisions for jdkge (tutor's logic decisions, 2026-10-28):
+
+- Natural log in the JSD pipeline.
+- The IQR uses numpy's default percentile method.
+- cv uses ddof 0 for both series.
+- The number of bins is the ceiling of the ratio rounded to 9 decimals.
+- One cleaned sample (no missing, non-finite or negative values) for all four
+  terms.
+- Zeros become epsilon only inside the JSD pipeline.
+- Fewer than 4 years of pairs gives a warning, not an error (the paper only
+  recommends 4 years).
+- The fixed-reference option is not part of this step.
 """
 
 import math
 import numbers
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -84,6 +103,10 @@ DEFAULT_HIGH_BLOCK = (85, 90, 95, 99)   # same as the pdi_high list in performan
 BLOCK_AGG_OPTIONS = ("mean", "median", "max", "sum")
 KGE_PERCENTILE_BLOCK_TERMS = ("r", "alpha", "beta", "low_block", "high_block")
 KGE_NP_TERMS = ("r_s", "alpha_np", "beta")
+JDKGE_TERMS = ("r", "beta", "alpha", "jsd")
+JSD_MIN_BINS = 25
+JSD_MAX_BINS = 100
+JSD_MIN_YEARS = 4
 
 
 def _check_real(name, value):
@@ -500,3 +523,158 @@ def kge_np(df, sim_col="Qsim", obs_col="Qobs", weights=None, nonpositive="keep",
         float: the score, ideal 1.
     """
     return combine_terms(_kge_np_terms(df, sim_col, obs_col, nonpositive, offset_frac), weights)
+
+
+def _jsd(p, q):
+    """
+    Jensen-Shannon divergence, base 2, of two probability vectors of equal
+    length that sum to 1: m = (p + q) / 2, JSD = 0.5 * sum(p * log2(p / m))
+    + 0.5 * sum(q * log2(q / m)). A summand whose p_i (or q_i) is 0
+    contributes 0 (Ficchi et al. 2026, Section 2.1.3).
+    """
+    p, q = np.asarray(p, dtype=float), np.asarray(q, dtype=float)
+    m = (p + q) / 2.0
+    total = 0.0
+    for a in (p, q):
+        nonzero = a > 0
+        total += 0.5 * float(np.sum(a[nonzero] * np.log2(a[nonzero] / m[nonzero])))
+    return total
+
+
+def _bin_indices(x, edges):
+    """
+    Bin of each value of x for the bins defined by edges, with the paper's
+    closure: the first bin is [edges[0], edges[1]], every later bin is
+    (edges[i-1], edges[i]]. Values outside the edges (and a last edge that
+    differs from the maximum by rounding) are clipped into the end bins.
+    """
+    indices = np.searchsorted(edges, x, side="left") - 1
+    return np.clip(indices, 0, len(edges) - 2)
+
+
+def _number_of_bins(x_obs, x_min, x_max, epsilon, ts_factor=1.0):
+    """
+    Number of equal-width bins (Ficchi et al. 2026, Section 2.1.3):
+    Freedman-Diaconis width h_fd = 2 * IQR(x_obs) * n_obs ** (-1/3), or
+    (x_max - x_min) / JSD_MIN_BINS when the IQR is 0; h = max(h_fd,
+    min(100 * epsilon, 0.1)); n_raw = ceil(ts_factor ** (1/3) * (x_max - x_min)
+    / h), the ratio rounded to 9 decimals before the ceiling; the result is
+    n_raw limited to [JSD_MIN_BINS, JSD_MAX_BINS]. ts_factor is the time step in
+    days (1 for daily data).
+    """
+    q25, q75 = np.percentile(x_obs, [25, 75])
+    iqr = q75 - q25
+    if iqr > 0:
+        h_fd = 2.0 * iqr * len(x_obs) ** (-1.0 / 3.0)
+    else:
+        h_fd = (x_max - x_min) / JSD_MIN_BINS
+    h = max(h_fd, min(100.0 * epsilon, 0.1))
+    n_raw = math.ceil(round(ts_factor ** (1.0 / 3.0) * (x_max - x_min) / h, 9))
+    return max(min(n_raw, JSD_MAX_BINS), JSD_MIN_BINS)
+
+
+def _jsd_between(obs, sim, ts_factor):
+    """
+    JSD of the log-flow histograms of two non-negative finite arrays of equal
+    length (Ficchi et al. 2026, Section 2.1.3): epsilon = min(1e-6, 0.1 *
+    smallest positive value of obs and sim); zeros replaced by epsilon; natural
+    log; bins on the common support of both series (_number_of_bins); densities
+    count / (n * width) plus epsilon, renormalized to probabilities; _jsd.
+
+    Raises ValueError if neither array has a positive value.
+    """
+    obs, sim = np.asarray(obs, dtype=float), np.asarray(sim, dtype=float)
+    c = np.concatenate([obs[obs > 0], sim[sim > 0]])
+    if c.size == 0:
+        raise ValueError("JSD needs at least one positive flow value")
+    epsilon = min(1e-6, 0.1 * c.min())
+    obs = np.where(obs == 0, epsilon, obs)
+    sim = np.where(sim == 0, epsilon, sim)
+    x_obs, x_sim = np.log(obs), np.log(sim)
+    x_min = min(x_obs.min(), x_sim.min())
+    x_max = max(x_obs.max(), x_sim.max())
+    n_bins = _number_of_bins(x_obs, x_min, x_max, epsilon, ts_factor)
+    edges = x_min + (np.arange(n_bins + 1) / n_bins) * (x_max - x_min)
+    count_obs = np.bincount(_bin_indices(x_obs, edges), minlength=n_bins)
+    count_sim = np.bincount(_bin_indices(x_sim, edges), minlength=n_bins)
+    widths = np.diff(edges)
+    p_tilde = count_obs / (len(x_obs) * widths) + epsilon
+    q_tilde = count_sim / (len(x_sim) * widths) + epsilon
+    return _jsd(p_tilde / p_tilde.sum(), q_tilde / q_tilde.sum())
+
+
+def jdkge(df, sim_col="Qsim", obs_col="Qobs", weights=None, ts_factor=1.0):
+    """
+    JDKGE (Ficchi et al. 2026, preprint egusphere-2026-43, Eq. 2): KGE' plus
+    the squared Jensen-Shannon divergence of the log-flow histograms; 1 - sqrt
+    of the weighted sum of four terms, higher is better, ideal 1. With all
+    weights 1: 1 - sqrt((r-1)^2 + (beta-1)^2 + (alpha-1)^2 + JSD^2).
+
+    Terms (names in JDKGE_TERMS):
+        "r":     (1 - r) ** 2, r the Pearson correlation;
+        "beta":  (1 - beta) ** 2, beta = mean_sim / mean_obs;
+        "alpha": (1 - alpha) ** 2, alpha = cv_sim / cv_obs, cv = std / mean
+                 (ddof 0 for both);
+        "jsd":   JSD ** 2, the JSD (base 2) of the log-flow histograms
+                 (Sections 2.1.2 and 2.1.3): zeros replaced by epsilon =
+                 min(1e-6, 0.1 * smallest positive value), natural log, bins
+                 on the union of both series, Freedman-Diaconis width from the
+                 observed series, 25 to 100 bins, densities smoothed with
+                 epsilon and renormalized.
+
+    Pairs: rows where either value is missing, not finite or negative are
+    dropped; the same cleaned sample (zeros included) is used for all four
+    terms. jdkge has no nonpositive switch: this is its own pipeline.
+
+    Parameters:
+        df (pd.DataFrame): table containing `sim_col` and `obs_col`.
+        sim_col, obs_col (str): simulated and observed discharge columns.
+        weights (dict or None): weights by term name (see normalize_weights);
+            an unknown name raises ValueError.
+        ts_factor (float): the paper's ts_f, the time step in days (1 for
+            daily data); scales the bin count and the record-length check.
+
+    Decisions (tutor's logic decisions, 2026-10-28):
+        - Natural log; IQR with numpy's default percentile method; ddof 0
+          for cv; ceiling after rounding to 9 decimals.
+        - One cleaned sample for all four terms (the paper does not say which
+          sample the KGE' terms use); zeros become epsilon only inside the
+          JSD pipeline.
+        - Fewer than JSD_MIN_YEARS years of pairs gives a UserWarning, not an
+          error (the paper only recommends 4 years of daily data).
+        - The fixed-reference option is not part of this step.
+
+    Raises ValueError for fewer than 2 pairs, a zero observed or simulated
+    std, or an observed or simulated mean <= 0.
+
+    Returns:
+        float: the score, ideal 1.
+    """
+    values = df[[sim_col, obs_col]].to_numpy(dtype=float)
+    keep = np.all(np.isfinite(values), axis=1) & np.all(values >= 0, axis=1)
+    sim, obs = values[keep, 0], values[keep, 1]
+    n = len(obs)
+    if n < 2:
+        raise ValueError(f"JDKGE needs at least 2 valid pairs, got {n}")
+    years = n * ts_factor / 365.25
+    if years < JSD_MIN_YEARS:
+        warnings.warn(f"jdkge: {n} pairs cover about {years:.2f} years; Ficchi et al. (2026) "
+                      f"recommend at least {JSD_MIN_YEARS} years of daily observed data",
+                      UserWarning, stacklevel=2)
+
+    obs_std, sim_std, obs_mean, sim_mean = obs.std(), sim.std(), obs.mean(), sim.mean()
+    if obs_std == 0:
+        raise ValueError("observed series has zero variance; JDKGE is undefined")
+    if sim_std == 0:
+        raise ValueError("simulated series has zero variance; JDKGE is undefined")
+    if obs_mean <= 0:
+        raise ValueError(f"observed series has mean {obs_mean!r} <= 0; JDKGE is undefined")
+    if sim_mean <= 0:
+        raise ValueError(f"simulated series has mean {sim_mean!r} <= 0; JDKGE is undefined")
+    r = np.corrcoef(sim, obs)[0, 1]
+    beta = sim_mean / obs_mean
+    alpha = (sim_std / sim_mean) / (obs_std / obs_mean)
+    jsd = _jsd_between(obs, sim, ts_factor)
+    terms = {"r": (1.0 - r) ** 2, "beta": (1.0 - beta) ** 2, "alpha": (1.0 - alpha) ** 2,
+             "jsd": jsd ** 2}
+    return combine_terms(terms, weights)
