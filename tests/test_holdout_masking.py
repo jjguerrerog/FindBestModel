@@ -10,6 +10,7 @@ Run from the repository root:  python -m unittest -v tests.test_holdout_masking
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -237,6 +238,8 @@ OLD_KEYS = ["gauge", "start_year", "end_year", "warmup_years", "n_realizations",
             "elapsed_seconds"]
 NEW_KEYS = ["run_label", "status", "started_at", "holdout_mode", "holdout_years",
             "holdout_position", "holdout_intervals", "extreme_date", "extreme_value"]
+# the 4 keys added by sim-helper (early write)
+SIM_HELPER_KEYS = ["q_floor", "time_step", "git_commit", "git_dirty"]
 # hold-out information returned by the prepare_data stub (02232000-like values)
 STUB_HOLDOUT = {"intervals": [["2021-10-01", "2024-09-30"]],
                 "extreme_date": "2022-10-03", "extreme_value": 7.163}
@@ -356,8 +359,8 @@ class TestRunLog(unittest.TestCase):
         self.assertNotIn("models_evaluated", info)
         self.assertNotIn("elapsed_seconds", info)
 
-    # after main() finishes: status "finished" and exactly the 18 old + 9 new keys
-    # (18 + 9 = 27)
+    # after main() finishes: status "finished" and exactly the 18 old + 9 run-log
+    # + 4 sim-helper keys (18 + 9 + 4 = 31)
     def test_final_write(self):
         expected = ["gauge", "start_year", "end_year", "warmup_years", "n_realizations",
                     "n_procs", "seed", "precip_source", "nasa_sampling", "et_method",
@@ -365,9 +368,10 @@ class TestRunLog(unittest.TestCase):
                     "temperature_available", "models_evaluated", "models_removed",
                     "models_skipped_no_temperature", "elapsed_seconds",
                     "run_label", "status", "started_at", "holdout_mode", "holdout_years",
-                    "holdout_position", "holdout_intervals", "extreme_date", "extreme_value"]
-        self.assertEqual(len(expected), 27)
-        self.assertEqual(expected, OLD_KEYS + NEW_KEYS)
+                    "holdout_position", "holdout_intervals", "extreme_date", "extreme_value",
+                    "q_floor", "time_step", "git_commit", "git_dirty"]
+        self.assertEqual(len(expected), 31)
+        self.assertEqual(expected, OLD_KEYS + NEW_KEYS + SIM_HELPER_KEYS)
         with tempfile.TemporaryDirectory() as tmp:
             self.run_main(tmp, self.argv("--holdout-mode", "max_event", "--run-label", "final"))
             info = self.read_run_info(Path(tmp) / self.GAUGE / "final")
@@ -437,6 +441,136 @@ class TestRunLog(unittest.TestCase):
             # no run folder and no run_info.json anywhere in the temporary folder
             self.assertFalse((Path(tmp) / self.GAUGE / "snow_only").exists())
             self.assertEqual(list(Path(tmp).rglob("run_info.json")), [])
+
+
+def sim_data():
+    # 5 simulated days: day 1 is warm-up (eval_mask False), days 2-5 are scored
+    return {"P": np.zeros(5), "Ep": np.zeros(5), "T": None, "t": np.arange(1.0, 6.0),
+            "eval_mask": np.array([False, True, True, True, True])}
+
+
+class TestSimulateSeries(unittest.TestCase):
+    # marrmot.simulate is stubbed with a known Q, so no model runs. Model 1
+    # (Collie River Basin 1) has n_stores = 1 in marrmot_models.MODEL_REGISTRY.
+
+    # stub Q = [5.0, 0.0, 2e-5, 3.0, -1.0]; eval_mask drops day 1 -> [0.0, 2e-5, 3.0, -1.0];
+    # floor at Q_FLOOR = 1e-4: 0.0 -> 1e-4, 2e-5 -> 1e-4, 3.0 stays, -1.0 -> 1e-4
+    def test_floor_and_eval_days(self):
+        with mock.patch.object(fbm.marrmot, "simulate",
+                               return_value={"Q": [5.0, 0.0, 2e-5, 3.0, -1.0]}) as stub:
+            out = fbm.simulate_series(1, {"Smax": 100.0}, sim_data())
+        self.assertIsInstance(out, np.ndarray)
+        self.assertEqual(out.tolist(), [1e-4, 1e-4, 3.0, 1e-4])
+        # S0 = n_stores (1) stores at INITIAL_STORAGE (1.0 mm) -> [1.0]; dt = TIME_STEP = 1.0
+        kwargs = stub.call_args.kwargs
+        self.assertEqual(kwargs["S0"].tolist(), [1.0])
+        self.assertEqual(kwargs["dt"], 1.0)
+
+    # inf on day 3 (an evaluation day) -> FloatingPointError
+    def test_nonfinite_raises(self):
+        with mock.patch.object(fbm.marrmot, "simulate",
+                               return_value={"Q": [1.0, 1.0, np.inf, 1.0, 1.0]}):
+            with self.assertRaises(FloatingPointError):
+                fbm.simulate_series(1, {"Smax": 100.0}, sim_data())
+
+    # NaN only on day 1 (warm-up, eval_mask False) -> dropped before the check,
+    # no error; days 2-5 = 2.0 (above the floor) -> [2.0, 2.0, 2.0, 2.0]
+    def test_nonfinite_warmup_ignored(self):
+        with mock.patch.object(fbm.marrmot, "simulate",
+                               return_value={"Q": [np.nan, 2.0, 2.0, 2.0, 2.0]}):
+            out = fbm.simulate_series(1, {"Smax": 100.0}, sim_data())
+        self.assertEqual(out.tolist(), [2.0, 2.0, 2.0, 2.0])
+
+    # _run_one keeps its error handling: the FloatingPointError of the helper
+    # becomes (None, "<type>: <message>") = (None, "FloatingPointError: simulated
+    # flow is not finite")
+    def test_run_one_reports_error(self):
+        data = sim_data()
+        data.update({"Qobs": np.ones(4), "dates": pd.date_range("2020-01-02", periods=4),
+                     "hidden": np.zeros(4, dtype=bool), "nonpositive_obs": "keep",
+                     "obs_offset_frac": 0.01})
+        with mock.patch.object(fbm, "_DATA", data), \
+                mock.patch.object(fbm.marrmot, "simulate",
+                                  return_value={"Q": [1.0, 1.0, np.inf, 1.0, 1.0]}):
+            result = fbm._run_one(1, {"Smax": 100.0})
+        self.assertEqual(result, (None, "FloatingPointError: simulated flow is not finite"))
+
+
+def git_stub(commit_out, status_out):
+    def run(cmd, **kwargs):
+        stdout = commit_out if cmd[1] == "rev-parse" else status_out
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+    return run
+
+
+class TestGitState(unittest.TestCase):
+    # subprocess.run is stubbed, so git is never called
+
+    # rev-parse prints "abc123\n" (stripped -> "abc123"); empty porcelain -> clean (False)
+    def test_clean(self):
+        with mock.patch.object(fbm.subprocess, "run", side_effect=git_stub("abc123\n", "")):
+            self.assertEqual(fbm._git_state(), ("abc123", False))
+
+    # one porcelain line (" M holdout_blocks.py") -> not empty -> dirty (True)
+    def test_dirty(self):
+        with mock.patch.object(fbm.subprocess, "run",
+                               side_effect=git_stub("abc123\n", " M holdout_blocks.py\n")):
+            self.assertEqual(fbm._git_state(), ("abc123", True))
+
+    # git not installed: subprocess.run raises FileNotFoundError -> (None, None)
+    def test_git_missing(self):
+        with mock.patch.object(fbm.subprocess, "run", side_effect=FileNotFoundError("git")):
+            self.assertEqual(fbm._git_state(), (None, None))
+
+    # not a repository: git exits 128, check=True raises CalledProcessError -> (None, None)
+    def test_not_a_repository(self):
+        with mock.patch.object(fbm.subprocess, "run",
+                               side_effect=subprocess.CalledProcessError(128, ["git"])):
+            self.assertEqual(fbm._git_state(), (None, None))
+
+
+class TestRunInfoProvenance(unittest.TestCase):
+    # main() with the same patches as TestRunLog, plus _git_state; the run_search
+    # stub reads the early run_info.json
+    GAUGE = "02232000"
+
+    def early_run_info(self, git_state):
+        seen = {}
+
+        def search(out_dir, models, n, n_procs, data, seed):
+            seen["info"] = json.loads((out_dir / "run_info.json").read_text())
+            return pd.DataFrame(), {}
+
+        argv = ["find_best_model_holdout.py", "--gauge", self.GAUGE, "--n", "50",
+                "--start-year", "2020", "--end-year", "2025", "--n-procs", "1",
+                "--run-label", "provenance"]
+        data = {"T": np.zeros(1), "Qobs": np.array([1.0]), "holdout": NO_HOLDOUT}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(fbm, "PERFORMANCE_DIR", Path(tmp)), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(fbm, "_now_local", return_value=START), \
+                mock.patch.object(fbm, "_git_state", return_value=git_state), \
+                mock.patch.object(fbm, "prepare_data", return_value=data), \
+                mock.patch.object(fbm, "run_search", side_effect=search), \
+                mock.patch.object(fbm, "check_parameter_space"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            fbm.main()
+        return seen["info"]
+
+    # early file: q_floor = Q_FLOOR = 1e-4, time_step = TIME_STEP = 1.0, and the
+    # stubbed git state ("abc123", True)
+    def test_early_keys(self):
+        info = self.early_run_info(("abc123", True))
+        self.assertEqual(info["q_floor"], 1e-4)
+        self.assertEqual(info["time_step"], 1.0)
+        self.assertEqual(info["git_commit"], "abc123")
+        self.assertIs(info["git_dirty"], True)
+
+    # without git, _git_state gives (None, None) -> both keys null in JSON
+    def test_no_git(self):
+        info = self.early_run_info((None, None))
+        self.assertIsNone(info["git_commit"])
+        self.assertIsNone(info["git_dirty"])
 
 
 if __name__ == "__main__":

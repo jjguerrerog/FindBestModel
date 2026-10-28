@@ -11,7 +11,9 @@
 #   - Module docstring: the results path says
 #     performance_holdout/<gauge>/<run_label>/, and the usage examples call
 #     find_best_model_holdout.py.
-#   - New imports: holdout_blocks (as hb), datetime.
+#   - New imports: holdout_blocks (as hb), datetime, subprocess.
+#   - New constant TIME_STEP (the dt passed to marrmot.simulate, 1.0 as in the
+#     original's hard-coded value).
 #   - New arguments: --holdout-mode (none | max_event | min_flow, default none),
 #     --holdout-years, --holdout-position, --overwrite-results, --run-label.
 #     With --holdout-mode none the scores are the same as the original's.
@@ -30,7 +32,9 @@
 #       main() stops with "Nothing left to evaluate") and at the end
 #       (status "finished"). New keys: run_label, status, started_at,
 #       holdout_mode, holdout_years, holdout_position, holdout_intervals,
-#       extreme_date, extreme_value.
+#       extreme_date, extreme_value, and (early write) q_floor, time_step,
+#       git_commit, git_dirty (git state at the start of the run).
+#     - _git_state (new): git commit hash and dirty flag (None, None without git).
 #     - _now_local (new): current local time, timezone-aware.
 #     - _run_folder (new): PERFORMANCE_DIR / gauge / run_label.
 #     - run_search: takes the run folder (out_dir) instead of the gauge.
@@ -44,8 +48,11 @@
 #       block's intervals, extreme date and extreme value as JSON-ready
 #       types; all None with mode none). data["Qobs"] stays the full
 #       observed series.
-#     - _run_one: the models still simulate the whole period; on hidden days
-#       both the simulated and the observed flow are set to NaN
+#     - simulate_series (new): the simulation part of the original _run_one
+#       (initial storages, marrmot.simulate, evaluation days, finite check,
+#       Q_FLOOR), shared with later re-simulation.
+#     - _run_one: calls simulate_series; the models still simulate the whole
+#       period; on hidden days both the simulated and the observed flow are set to NaN
 #       (hb.mask_hidden) before compute_metrics, so a simulated peak on a
 #       hidden day cannot leak into a calendar-year metric.
 
@@ -94,6 +101,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 import warnings
@@ -119,6 +127,7 @@ PERFORMANCE_DIR = HERE / "performance_holdout"
 
 INITIAL_STORAGE = 1.0  # [mm] every store starts nearly empty; the warm-up fills it
 Q_FLOOR = 1e-4         # [mm/day] same floor as Example 5, keeps log metrics defined
+TIME_STEP = 1.0        # dt passed to marrmot.simulate; assumed [days], not verified
 TEMPERATURE_COL = "T2M_MEAN (°C)"
 PRECIP_COL = "Precipitation (mm/day)"
 MAX_MISSING_AORC_DAYS = 30  # more than this and AORC doesn't cover the period
@@ -557,17 +566,25 @@ def compute_metrics(sim, nonpositive_obs="keep", obs_offset_frac=0.01):
     }
 
 
+def simulate_series(model_num, params, data):
+    """Simulated flow on the evaluation days, floored at Q_FLOOR (numpy array).
+
+    Raises FloatingPointError if any evaluation day is not finite.
+    """
+    S0 = np.full(marrmot.MODEL_REGISTRY[model_num]["n_stores"], INITIAL_STORAGE)
+    result = marrmot.simulate(model_num, data["P"], data["Ep"], params, S0=S0,
+                              dt=TIME_STEP, T=data["T"], t=data["t"])
+    Q = np.asarray(result["Q"], dtype=float)[data["eval_mask"]]
+    if not np.all(np.isfinite(Q)):
+        raise FloatingPointError("simulated flow is not finite")
+    return np.maximum(Q, Q_FLOOR)
+
+
 def _run_one(model_num, params):
     """Simulate one parameter set; returns (metrics, None) or (None, error)."""
     try:
-        S0 = np.full(marrmot.MODEL_REGISTRY[model_num]["n_stores"], INITIAL_STORAGE)
-        result = marrmot.simulate(model_num, _DATA["P"], _DATA["Ep"], params, S0=S0,
-                                  dt=1.0, T=_DATA["T"], t=_DATA["t"])
-        Q = np.asarray(result["Q"], dtype=float)[_DATA["eval_mask"]]
-        if not np.all(np.isfinite(Q)):
-            raise FloatingPointError("simulated flow is not finite")
-        sim = pd.DataFrame({"Q": np.maximum(Q, Q_FLOOR), "Qobs": _DATA["Qobs"]},
-                           index=_DATA["dates"])
+        Q = simulate_series(model_num, params, _DATA)
+        sim = pd.DataFrame({"Q": Q, "Qobs": _DATA["Qobs"]}, index=_DATA["dates"])
         # Hide both series: a calendar year can be half hidden, and
         # mean_annual_peak_flow_diff takes each series' yearly peak, so a
         # simulated peak on a hidden day would otherwise leak into the score.
@@ -606,6 +623,18 @@ def _build_table(samples, outcomes):
     table = pd.DataFrame(rows)
     table.index.name = "realization"
     return table
+
+
+def _git_state():
+    """(commit hash, dirty) of the repository holding this script; (None, None) without git."""
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=HERE, capture_output=True,
+                                text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+    return commit, status.strip() != ""
 
 
 def _now_local():
@@ -809,6 +838,8 @@ def main():
     except FileExistsError as err:
         print(err, file=sys.stderr)
         sys.exit(1)
+    # Code version at the start of the run (recorded only; nothing blocks or warns)
+    git_commit, git_dirty = _git_state()
     check_parameter_space()
 
     data = prepare_data(args.gauge, args.start_year, args.end_year,
@@ -867,6 +898,10 @@ def main():
         "holdout_intervals": data["holdout"]["intervals"],
         "extreme_date": data["holdout"]["extreme_date"],
         "extreme_value": data["holdout"]["extreme_value"],
+        "q_floor": Q_FLOOR,
+        "time_step": TIME_STEP,
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
