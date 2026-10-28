@@ -15,6 +15,9 @@ Conventions:
   value at all has no winner (None), which is not an error.
 - Ties go to the first row in table order (best_row) or to the lowest model
   number (best_model_per_metric).
+
+Across gauges, winner_agreement_counts counts how often two metrics pick the
+same winning model.
 """
 
 import json
@@ -95,6 +98,32 @@ def shared_winner_groups(winners):
         if model is not None:
             groups.setdefault(model, []).append(metric)
     return groups
+
+
+def winner_agreement_counts(winners_by_gauge, metrics):
+    """
+    (agree, both): two DataFrames indexed and columned by `metrics`, from
+    {gauge: the dict of best_model_per_metric}. both[a, b] counts the gauges
+    where a and b both have a winning model; agree[a, b] those where it is
+    also the same model. The diagonal counts the gauges where the metric has
+    a winner. Raises KeyError naming the gauge and the metric if a gauge's
+    dict lacks a metric.
+    """
+    metrics = list(metrics)
+    agree = pd.DataFrame(0, index=metrics, columns=metrics)
+    both = pd.DataFrame(0, index=metrics, columns=metrics)
+    for gauge, winners in winners_by_gauge.items():
+        models = {}
+        for metric in metrics:
+            if metric not in winners:
+                raise KeyError(f"gauge {gauge!r} has no entry for metric {metric!r}")
+            models[metric] = winners[metric]["model"]
+        for a in metrics:
+            for b in metrics:
+                if models[a] is not None and models[b] is not None:
+                    both.loc[a, b] += 1
+                    agree.loc[a, b] += int(models[a] == models[b])
+    return agree, both
 
 
 def _ok_rows(tables, columns):
