@@ -11,8 +11,12 @@ flow, inside the usable water years of the evaluation period:
   fluke, and a window with no-flow days is not a low-flow stretch).
 
 The block is returned as a list of (start, end) date intervals (inclusive),
-so a later version can hide several gaps with the same code.
+so a later version can hide several gaps with the same code. holdout_mask
+and mask_hidden turn the intervals into hidden days for scoring, and
+check_results_folder keeps a run from overwriting earlier results.
 """
+
+from pathlib import Path
 
 import pandas as pd
 
@@ -118,3 +122,49 @@ def build_holdout_block(obs, mode, start_year, end_year, holdout_years=3, positi
 def blocks_equal(a, b):
     """True if two results of build_holdout_block hide the same days."""
     return list(a["intervals"]) == list(b["intervals"])
+
+
+def holdout_mask(dates, intervals):
+    """Boolean numpy array: True for dates inside any (start, end) interval (inclusive)."""
+    days = pd.DatetimeIndex(dates).normalize()
+    mask = pd.Series(False, index=days).to_numpy()
+    for start, end in intervals:
+        mask = mask | ((days >= pd.Timestamp(start).normalize())
+                       & (days <= pd.Timestamp(end).normalize()))
+    return mask
+
+
+def mask_hidden(df, hidden):
+    """Copy of `df` with every column NaN on the hidden rows (`hidden` aligned with the rows)."""
+    hidden = pd.Series(hidden, index=df.index, dtype=bool)
+    return df.mask(pd.DataFrame({col: hidden for col in df.columns}, index=df.index))
+
+
+def low_coverage_water_years(obs, intervals, threshold=0.99):
+    """Water years of the intervals with less than `threshold` of their days observed.
+
+    obs is a daily pd.Series with a DatetimeIndex (NaN or a missing row = not
+    observed). Each water year is counted over its days inside the interval.
+    Returns a list of (water_year, observed_days, total_days, fraction).
+    """
+    low = []
+    for start, end in intervals:
+        start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+        for wy in range(water_year(start), water_year(end) + 1):
+            wy_start, wy_end = water_year_bounds(wy)
+            first, last = max(start, wy_start), min(end, wy_end)
+            total = (last - first).days + 1
+            observed = int(obs.loc[first:last].notna().sum())
+            if observed / total < threshold:
+                low.append((wy, observed, total, observed / total))
+    return low
+
+
+def check_results_folder(out_dir, overwrite=False):
+    """Raise FileExistsError if `out_dir` already holds a run (run_info.json), unless `overwrite`."""
+    run_info = Path(out_dir) / "run_info.json"
+    if run_info.exists() and not overwrite:
+        raise FileExistsError(
+            f"{run_info} already exists: the results in {Path(out_dir)} are from an earlier run, "
+            "and this hold-out run would overwrite them. Pass --overwrite-results to allow it, "
+            "or move that folder first.")

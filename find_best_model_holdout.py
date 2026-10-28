@@ -8,7 +8,30 @@
 #     instead of performance/, so a hold-out run never overwrites a normal run.
 #   - Module docstring: the results path says performance_holdout/, and the
 #     usage examples call find_best_model_holdout.py.
-#   - Functions changed: none yet.
+#   - New import: holdout_blocks (as hb).
+#   - New arguments: --holdout-mode (none | max_event | min_flow, default none),
+#     --holdout-years, --holdout-position, --overwrite-results.
+#     With --holdout-mode none the scores are the same as the original's.
+#   - Functions changed:
+#     - parse_args: the four new arguments and their checks.
+#     - main: overwrite guard (hb.check_results_folder) right after
+#       parse_args, before any data is prepared; it stops the run if the
+#       gauge folder already has a run_info.json, unless --overwrite-results
+#       (the original overwrites silently); it then prints only the message
+#       to stderr and exits with code 1. Passes the hold-out arguments to
+#       prepare_data.
+#     - _coverage_warnings (new): WARNING lines for the block's water years
+#       with less than 99% of their days observed
+#       (hb.low_coverage_water_years).
+#     - prepare_data: new holdout_mode, holdout_years and holdout_position
+#       arguments; builds the hold-out block (hb.build_holdout_block) on the
+#       observed evaluation days, prints it, prints _coverage_warnings, and adds
+#       data["hidden"] (all False with mode none). data["Qobs"] stays the
+#       full observed series.
+#     - _run_one: the models still simulate the whole period; on hidden days
+#       both the simulated and the observed flow are set to NaN
+#       (hb.mask_hidden) before compute_metrics, so a simulated peak on a
+#       hidden day cannot leak into a calendar-year metric.
 
 """
 Search for the best MARRMoT model structure for a USGS watershed.
@@ -69,6 +92,7 @@ sys.path.insert(0, str(HERE))  # all helper modules live next to this script
 
 import get_aorc_basin_rainfall as aorc  # noqa: E402
 import get_usgs_gauge_data as usgs  # noqa: E402
+import holdout_blocks as hb  # noqa: E402
 import marrmot_models as marrmot  # noqa: E402
 import performance_metrics as pm  # noqa: E402
 from model_parameter_space import check_parameter_space, sample_parameters  # noqa: E402
@@ -324,8 +348,16 @@ def needs_temperature(model_num):
     return "T" in marrmot.MODEL_REGISTRY[model_num]["forcing_vars"]
 
 
+def _coverage_warnings(observed, intervals):
+    """WARNING lines for the hold-out water years with less than 99% of their days observed."""
+    return [f"  WARNING: water year {wy} of the hold-out block has only "
+            f"{fraction:.1%} of its days observed"
+            for wy, _, _, fraction in hb.low_coverage_water_years(observed, intervals)]
+
+
 def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow=False,
-                 precip_source="aorc", nasa_sampling="point"):
+                 precip_source="aorc", nasa_sampling="point", holdout_mode="none",
+                 holdout_years=3, holdout_position=None):
     """
     Downloads (or reuses) the gauge data and returns the arrays every
     simulation needs, covering the warm-up and evaluation periods.
@@ -341,6 +373,11 @@ def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow
     not downloaded: the forcing stored in the gauge file is used instead
     (also the fallback if that download fails). It has no temperature, so
     the returned "T" is None and the snow models have to be skipped.
+
+    With holdout_mode "max_event" or "min_flow", a block of holdout_years
+    whole water years around that extreme of the observed flow is hidden
+    from the scoring: data["hidden"] is True on its evaluation days (all
+    False with "none"). data["Qobs"] is still the full observed series.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     first_year = start_year - warmup_years
@@ -411,14 +448,31 @@ def prepare_data(gauge, start_year, end_year, warmup_years, et_method, skip_snow
     print(f"Evaluation:    {dates[eval_mask][0].date()} to {dates[-1].date()} "
           f"({n_obs} days with observed flow)")
 
+    eval_dates = dates[eval_mask]
+    eval_qobs = qobs.to_numpy(dtype=float)[eval_mask]
+    hidden = np.zeros(len(eval_dates), dtype=bool)
+    if holdout_mode != "none":
+        observed = pd.Series(eval_qobs, index=eval_dates)
+        block = hb.build_holdout_block(observed, holdout_mode,
+                                       start_year, end_year, holdout_years, holdout_position)
+        hidden = hb.holdout_mask(eval_dates, block["intervals"])
+        intervals = ", ".join(f"{s.date()} to {e.date()}" for s, e in block["intervals"])
+        print(f"Hold-out:      {intervals} (water years {block['first_water_year']}-"
+              f"{block['last_water_year']}, {int(hidden.sum())} days hidden from the scoring)")
+        print(f"               {holdout_mode}: {block['extreme_value']:.4g} mm/day "
+              f"on {block['extreme_date'].date()}")
+        for line in _coverage_warnings(observed, block["intervals"]):
+            print(line)
+
     return {
         "P": forcing[PRECIP_COL].to_numpy(dtype=float),
         "Ep": forcing[f"ET {et_method} (mm/day)"].to_numpy(dtype=float),
         "T": forcing[TEMPERATURE_COL].to_numpy(dtype=float) if has_temperature else None,
         "t": dates.dayofyear.to_numpy(dtype=float),
-        "Qobs": qobs.to_numpy(dtype=float)[eval_mask],
-        "dates": dates[eval_mask],
+        "Qobs": eval_qobs,
+        "dates": eval_dates,
         "eval_mask": eval_mask,
+        "hidden": hidden,
     }
 
 
@@ -486,6 +540,11 @@ def _run_one(model_num, params):
             raise FloatingPointError("simulated flow is not finite")
         sim = pd.DataFrame({"Q": np.maximum(Q, Q_FLOOR), "Qobs": _DATA["Qobs"]},
                            index=_DATA["dates"])
+        # Hide both series: a calendar year can be half hidden, and
+        # mean_annual_peak_flow_diff takes each series' yearly peak, so a
+        # simulated peak on a hidden day would otherwise leak into the score.
+        if _DATA["hidden"].any():
+            sim = hb.mask_hidden(sim, _DATA["hidden"])
         return compute_metrics(sim, _DATA["nonpositive_obs"], _DATA["obs_offset_frac"]), None
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}"
@@ -642,6 +701,18 @@ def parse_args():
     parser.add_argument("--skip-snow", action="store_true",
                         help="skip the 12 snow models that need temperature "
                              "(e.g. for watersheds without snow)")
+    parser.add_argument("--holdout-mode", default="none", choices=("none",) + hb.MODES,
+                        help="hide a block of whole water years from the scoring, around the "
+                             "largest daily flow (max_event) or the lowest 7-day mean flow with "
+                             "every day above zero (min_flow); 'none' (default) scores every "
+                             "observed day")
+    parser.add_argument("--holdout-years", type=int, default=3,
+                        help="length of the hold-out block in water years (default: 3)")
+    parser.add_argument("--holdout-position", type=int, default=None,
+                        help="index (0-based) of the block year that holds the extreme "
+                             "(default: the middle year, holdout-years // 2)")
+    parser.add_argument("--overwrite-results", action="store_true",
+                        help="allow overwriting a results folder that already has a run_info.json")
     args = parser.parse_args()
 
     cpus = os.cpu_count() or 1
@@ -667,16 +738,33 @@ def parse_args():
         parser.error("--end-year must not be before --start-year")
     if args.obs_offset_frac <= 0:
         parser.error("--obs-offset-frac must be positive")
+    if args.holdout_mode != "none":
+        n_usable = len(hb.usable_water_years(args.start_year, args.end_year))
+        if not 1 <= args.holdout_years <= n_usable:
+            parser.error(f"--holdout-years must be between 1 and {n_usable} (the water years "
+                         f"from Oct 1, {args.start_year} to Sep 30, {args.end_year})")
+        if args.holdout_position is not None and not 0 <= args.holdout_position < args.holdout_years:
+            parser.error(f"--holdout-position must be between 0 and {args.holdout_years - 1}")
     return args
 
 
 def main():
     args = parse_args()
+    # Guard against overwriting results. For now it checks the gauge folder; the
+    # run-log step moves the check to the per-run folder (the guard stays).
+    # Print only the message (no traceback) and exit non-zero.
+    try:
+        hb.check_results_folder(PERFORMANCE_DIR / args.gauge, args.overwrite_results)
+    except FileExistsError as err:
+        print(err, file=sys.stderr)
+        sys.exit(1)
     check_parameter_space()
 
     data = prepare_data(args.gauge, args.start_year, args.end_year,
                         args.warmup_years, args.et_method, skip_snow=args.skip_snow,
-                        precip_source=args.precip_source, nasa_sampling=args.nasa_sampling)
+                        precip_source=args.precip_source, nasa_sampling=args.nasa_sampling,
+                        holdout_mode=args.holdout_mode, holdout_years=args.holdout_years,
+                        holdout_position=args.holdout_position)
     data["nonpositive_obs"] = args.nonpositive_obs
     data["obs_offset_frac"] = args.obs_offset_frac
 
