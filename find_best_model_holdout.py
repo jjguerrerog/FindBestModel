@@ -11,12 +11,17 @@
 #   - Module docstring: the results path says
 #     performance_holdout/<gauge>/<run_label>/, and the usage examples call
 #     find_best_model_holdout.py.
-#   - New imports: holdout_blocks (as hb), datetime, subprocess.
+#   - New imports: holdout_blocks (as hb), gap_fill_metrics (as gm), datetime,
+#     subprocess.
+#   - SUMMARY_METRICS (module constant): the original five names followed by
+#     gm.metric_columns(), so summary.parquet gets a best value for every new
+#     metric column too.
 #   - New constant TIME_STEP (the dt passed to marrmot.simulate, 1.0 as in the
 #     original's hard-coded value).
 #   - New arguments: --holdout-mode (none | max_event | min_flow, default none),
 #     --holdout-years, --holdout-position, --overwrite-results, --run-label.
-#     With --holdout-mode none the scores are the same as the original's.
+#     With --holdout-mode none the 14 original scores are the same as the
+#     original's.
 #   - Functions changed:
 #     - parse_args: the five new arguments and their checks (a manual
 #       --run-label may hold only letters, digits, underscore and hyphen).
@@ -48,6 +53,11 @@
 #       block's intervals, extreme date and extreme value as JSON-ready
 #       types; all None with mode none). data["Qobs"] stays the full
 #       observed series.
+#     - compute_metrics: the 14 original columns are unchanged; the new
+#       metric columns (gm.compute_all, in the order of gm.metric_columns())
+#       and "metrics_error" are appended. An unexpected exception in
+#       gm.compute_all gives NaN in every new column and its message in
+#       metrics_error, never a failed realization.
 #     - simulate_series (new): the simulation part of the original _run_one
 #       (initial storages, marrmot.simulate, evaluation days, finite check,
 #       Q_FLOOR), shared with later re-simulation.
@@ -76,9 +86,16 @@ For a given USGS gauge, this script:
    (the same random search as `run_param_sweep` in Example 5), in parallel.
 3. Saves one table per model, with each realization's parameters and its
    NSE, KGE (+ KGE_r, KGE_alpha, KGE_beta), PBIAS, correlation, peak-flow difference,
-   pdi_ave, pdi_ave2, pdi_ave3, pdi_low, pdi_high and log_NSE, to
+   pdi_ave, pdi_ave2, pdi_ave3, pdi_low, pdi_high and log_NSE, then the new
+   gap-filling metrics of `gap_fill_metrics.py` (KGE_TA_p5_p95,
+   KGE_TA_p5_p95_log, KGE_TA_p2_p98, KGE_TA_p2_p98_log, KGE_PB_pdi,
+   KGE_PB_pdi_log, PNSE_p5_p95, PNSE_p5_p95_log, KGE_NP, JDKGE) and
+   metrics_error (None when the new metrics ran without an unexpected
+   exception, else its message), to
    `performance_holdout/<gauge>/<run_label>/model_NN_<name>.parquet`, plus a
    `summary.parquet` with each model's best scores and a `run_info.json`.
+   With --holdout-mode none the 14 original columns equal the original
+   script's; the new columns are extras.
 
 A model is removed (no table written) when every one of its realizations
 fails. Each model's first year(s) are a warm-up period and are not scored.
@@ -120,6 +137,7 @@ import get_usgs_gauge_data as usgs  # noqa: E402
 import holdout_blocks as hb  # noqa: E402
 import marrmot_models as marrmot  # noqa: E402
 import performance_metrics as pm  # noqa: E402
+import gap_fill_metrics as gm  # noqa: E402
 from model_parameter_space import check_parameter_space, sample_parameters  # noqa: E402
 
 DATA_DIR = HERE / "data"
@@ -131,7 +149,7 @@ TIME_STEP = 1.0        # dt passed to marrmot.simulate; assumed [days], not veri
 TEMPERATURE_COL = "T2M_MEAN (°C)"
 PRECIP_COL = "Precipitation (mm/day)"
 MAX_MISSING_AORC_DAYS = 30  # more than this and AORC doesn't cover the period
-SUMMARY_METRICS = ["NSE", "KGE", "log_NSE", "pdi_ave", "pdi_low"]
+SUMMARY_METRICS = ["NSE", "KGE", "log_NSE", "pdi_ave", "pdi_low"] + gm.metric_columns()
 MAX_CHUNK = 20         # realizations per parallel task
 
 
@@ -548,7 +566,7 @@ def compute_metrics(sim, nonpositive_obs="keep", obs_offset_frac=0.01):
         kge = dict.fromkeys(("KGE", "r", "alpha", "beta"), np.nan)
     # KGE components are prefixed: several MARRMoT models have parameters
     # named r, alpha or beta, which share the table with the metrics.
-    return {
+    metrics = {
         "NSE": _safe(pm.nse, sim, "Q", "Qobs", **mode),
         "KGE": kge["KGE"],
         "KGE_r": kge["r"],
@@ -564,6 +582,16 @@ def compute_metrics(sim, nonpositive_obs="keep", obs_offset_frac=0.01):
         "pdi_high": _safe(pm.percentiles_index, sim, [85, 90, 95, 99], "Q", "Qobs", **mode),
         "log_NSE": _safe(pm.nse, sim, "Q", "Qobs", log=True, **mode),
     }
+    try:
+        new_values = gm.compute_all(sim, sim_col="Q", obs_col="Qobs",
+                                    nonpositive=nonpositive_obs, offset_frac=obs_offset_frac)
+        metrics_error = None
+    except Exception as exc:
+        new_values = dict.fromkeys(gm.metric_columns(), np.nan)
+        metrics_error = f"{type(exc).__name__}: {exc}"
+    metrics.update(new_values)
+    metrics["metrics_error"] = metrics_error
+    return metrics
 
 
 def simulate_series(model_num, params, data):
