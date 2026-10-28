@@ -84,6 +84,12 @@ Decisions for jdkge (tutor's logic decisions, 2026-10-28):
 - Fewer than 4 years of pairs gives a warning, not an error (the paper only
   recommends 4 years).
 - The fixed-reference option is not part of this step.
+- ts_factor is checked first: a real number, finite and > 0 (TypeError or
+  ValueError otherwise), because ts_factor ** (1/3) of 0 or a negative number
+  would fail silently.
+- _jsd_between raises ValueError when every value of both series is identical
+  (all bin widths would be zero); jdkge cannot reach this because its std
+  checks run first, the guard protects future callers.
 """
 
 import math
@@ -581,7 +587,8 @@ def _jsd_between(obs, sim, ts_factor):
     log; bins on the common support of both series (_number_of_bins); densities
     count / (n * width) plus epsilon, renormalized to probabilities; _jsd.
 
-    Raises ValueError if neither array has a positive value.
+    Raises ValueError if neither array has a positive value, or if every value
+    of both series is identical (zero-width bins).
     """
     obs, sim = np.asarray(obs, dtype=float), np.asarray(sim, dtype=float)
     c = np.concatenate([obs[obs > 0], sim[sim > 0]])
@@ -593,6 +600,9 @@ def _jsd_between(obs, sim, ts_factor):
     x_obs, x_sim = np.log(obs), np.log(sim)
     x_min = min(x_obs.min(), x_sim.min())
     x_max = max(x_obs.max(), x_sim.max())
+    if x_max == x_min:
+        raise ValueError(f"every value of both series is identical (log value {x_min!r}); "
+                         "the histogram bins would have zero width")
     n_bins = _number_of_bins(x_obs, x_min, x_max, epsilon, ts_factor)
     edges = x_min + (np.arange(n_bins + 1) / n_bins) * (x_max - x_min)
     count_obs = np.bincount(_bin_indices(x_obs, edges), minlength=n_bins)
@@ -633,6 +643,8 @@ def jdkge(df, sim_col="Qsim", obs_col="Qobs", weights=None, ts_factor=1.0):
             an unknown name raises ValueError.
         ts_factor (float): the paper's ts_f, the time step in days (1 for
             daily data); scales the bin count and the record-length check.
+            Checked first: a real number (TypeError otherwise, also for bool
+            and strings), finite and > 0 (ValueError otherwise).
 
     Decisions (tutor's logic decisions, 2026-10-28):
         - Natural log; IQR with numpy's default percentile method; ddof 0
@@ -643,13 +655,17 @@ def jdkge(df, sim_col="Qsim", obs_col="Qobs", weights=None, ts_factor=1.0):
         - Fewer than JSD_MIN_YEARS years of pairs gives a UserWarning, not an
           error (the paper only recommends 4 years of daily data).
         - The fixed-reference option is not part of this step.
+        - ts_factor is checked before anything else.
 
-    Raises ValueError for fewer than 2 pairs, a zero observed or simulated
-    std, or an observed or simulated mean <= 0.
+    Raises ValueError for an invalid ts_factor, fewer than 2 pairs, a zero
+    observed or simulated std, or an observed or simulated mean <= 0.
 
     Returns:
         float: the score, ideal 1.
     """
+    _check_real("ts_factor", ts_factor)
+    if not math.isfinite(ts_factor) or ts_factor <= 0:
+        raise ValueError(f"ts_factor must be finite and > 0, got {ts_factor!r}")
     values = df[[sim_col, obs_col]].to_numpy(dtype=float)
     keep = np.all(np.isfinite(values), axis=1) & np.all(values >= 0, axis=1)
     sim, obs = values[keep, 0], values[keep, 1]
